@@ -84,3 +84,28 @@ func TestTheFlockMigratesWithGoose(t *testing.T) {
 		t.Fatalf("the schema at 2: %v", err)
 	}
 }
+
+// Two leaders may migrate at once, as when the first one's lock went with its
+// connection while it migrated: each migration is applied once, and both see
+// it done.
+func TestMigratingTwiceAtOnceAppliesOnce(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	conn, _ := geesetest.Start(t, ctx)
+	migrated := make(chan error, 4)
+	for range cap(migrated) {
+		go func() { migrated <- migrations.MigrateTo(ctx, conn, 2) }()
+	}
+	for range cap(migrated) {
+		if err := <-migrated; err != nil {
+			t.Fatalf("migrating alongside another leader: %v", err)
+		}
+	}
+	var applied int
+	if err := conn.QueryRowContext(ctx, `SELECT count(*) FROM goose_db_version WHERE version_id > 0`).Scan(&applied); err != nil {
+		t.Fatal(err)
+	}
+	if applied != 2 {
+		t.Fatalf("applied %d migrations, expected 2", applied)
+	}
+}

@@ -33,7 +33,7 @@ func TestGroundingCancelsWorkInFlightAndAdmitsNoMore(t *testing.T) {
 
 func TestOwnDeadlineGroundsAGooseWhoseHonkIsntHeard(t *testing.T) {
 	live := &Flock{requests: map[uint64]admission{}}
-	live.keepUntil(time.Now().Add(50 * time.Millisecond))
+	live.keepUntil(live.epoch(), time.Now().Add(50*time.Millisecond))
 	ctx, release, err := live.Admit(context.Background())
 	if err != nil {
 		t.Fatal(err)

@@ -18,6 +18,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/stdlib"
 	pressly "github.com/pressly/goose/v3"
+	"github.com/pressly/goose/v3/lock"
 
 	"github.com/jarensaa/geese"
 )
@@ -46,7 +47,15 @@ func (m Migrations) provider(db *sql.DB) (*pressly.Provider, error) {
 	if err != nil {
 		return nil, err
 	}
-	return pressly.NewProvider(pressly.DialectPostgres, db, dir, pressly.WithTableName(m.table()), pressly.WithDisableGlobalRegistry(true))
+	// Migrations run under goose's session lock: a leader whose own lock went
+	// with its connection may still be migrating when the next one starts, and
+	// the second then finds the work done.
+	locker, err := lock.NewPostgresSessionLocker()
+	if err != nil {
+		return nil, err
+	}
+	return pressly.NewProvider(pressly.DialectPostgres, db, dir, pressly.WithTableName(m.table()), pressly.WithDisableGlobalRegistry(true),
+		pressly.WithSessionLocker(locker))
 }
 
 // Version reads the latest migration goose's ledger says is applied, in the

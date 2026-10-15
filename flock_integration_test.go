@@ -377,3 +377,83 @@ func TestTheFlockCarriesOnFromTheCoordinatorGeeseCameFrom(t *testing.T) {
 		t.Fatalf("carried over again: %v", active)
 	}
 }
+
+// stalling is the stand-in's migrator, whose read of the version waits while
+// a test is waiting for it, until the test lets it go: so the test can act
+// while a honk is under way.
+type stalling struct {
+	ledger
+	reached, proceed chan struct{}
+}
+
+func newStalling() *stalling {
+	return &stalling{reached: make(chan struct{}), proceed: make(chan struct{})}
+}
+
+func (s *stalling) Version(ctx context.Context, tx *sql.Tx) (int64, error) {
+	select {
+	case s.reached <- struct{}{}:
+		<-s.proceed
+	default:
+	}
+	return s.ledger.Version(ctx, tx)
+}
+
+func joinStalling(t *testing.T, ctx context.Context, url string, migrator *stalling) *Flock {
+	t.Helper()
+	live, err := Join(ctx, Config{DatabaseURL: url, Name: "stalling", Release: "dev", Weather: ClearSkies{}, Migrator: migrator,
+		Window: Window{ServeFrom: 1, ServeTo: 2, Latest: 2}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(live.Land)
+	return live
+}
+
+// A goose told to stop while it honks finishes the honk, and its work in
+// flight goes on.
+func TestStoppingMidHonkLetsWorkInFlightFinish(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	_, url := standIn(t, ctx)
+	honk := newStalling()
+	live := joinStalling(t, ctx, url, honk)
+	work, release, err := live.Admit(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+
+	flying, stop := context.WithCancel(ctx)
+	landed := make(chan struct{})
+	go func() { live.Fly(flying); close(landed) }()
+	<-honk.reached
+	stop()
+	close(honk.proceed)
+	<-landed
+	if work.Err() != nil || !live.Ready() {
+		t.Fatal("stopping while a honk was under way cancelled the work in flight")
+	}
+}
+
+// A goose grounded while it honks stays grounded until the next honk: what
+// this one says, such as that it has gathered, may no longer be true.
+func TestGroundedMidHonkStaysGrounded(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	_, url := standIn(t, ctx)
+	honk := newStalling()
+	live := joinStalling(t, ctx, url, honk)
+
+	honked := make(chan error, 1)
+	go func() { honked <- live.Honk(ctx) }()
+	<-honk.reached
+	live.ground()
+	close(honk.proceed)
+	if err := <-honked; err == nil || live.Ready() {
+		t.Fatalf("a goose grounded mid-honk flew on: %v", err)
+	}
+	if err := live.Honk(ctx); err != nil || !live.Ready() {
+		t.Fatalf("the next honk didn't put it back in the air: %v", err)
+	}
+}

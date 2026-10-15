@@ -78,8 +78,8 @@ func (g *Rollout) get(ctx context.Context, path string, value any) error {
 	return json.NewDecoder(resp.Body).Decode(value)
 }
 
-// Calm says whether the Deployment has rolled out: its spec observed, and
-// every replica updated and ready. The service account's token is read again
+// Calm says whether the Deployment has rolled out: its spec observed, every
+// replica updated and ready, and no old replica left running. The service account's token is read again
 // for every request, as Kubernetes rotates it.
 func (g *Rollout) Calm(ctx context.Context) (bool, error) {
 	var deployment struct {
@@ -91,6 +91,7 @@ func (g *Rollout) Calm(ctx context.Context) (bool, error) {
 		} `json:"spec"`
 		Status struct {
 			ObservedGeneration int64 `json:"observedGeneration"`
+			Replicas           int   `json:"replicas"`
 			UpdatedReplicas    int   `json:"updatedReplicas"`
 			ReadyReplicas      int   `json:"readyReplicas"`
 		} `json:"status"`
@@ -100,6 +101,7 @@ func (g *Rollout) Calm(ctx context.Context) (bool, error) {
 		return false, err
 	}
 	settled := deployment.Metadata.Generation == deployment.Status.ObservedGeneration && deployment.Spec.Replicas >= 1 &&
-		deployment.Status.UpdatedReplicas == deployment.Spec.Replicas && deployment.Status.ReadyReplicas == deployment.Spec.Replicas
+		deployment.Status.Replicas == deployment.Spec.Replicas && deployment.Status.UpdatedReplicas == deployment.Spec.Replicas &&
+		deployment.Status.ReadyReplicas == deployment.Spec.Replicas
 	return settled, nil
 }

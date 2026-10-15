@@ -28,7 +28,9 @@ func (f *Flock) lead(ctx context.Context) (release func(), leading bool, err err
 		return nil, false, err
 	}
 	release = func() {
-		conn.ExecContext(context.Background(), `SELECT pg_advisory_unlock($1)`, leaderLock)
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		conn.ExecContext(ctx, `SELECT pg_advisory_unlock($1)`, leaderLock)
 		conn.Close()
 	}
 	if calm, err := f.weather.Calm(ctx); err != nil || !calm {
@@ -125,7 +127,10 @@ func (f *Flock) TryMigrate(ctx context.Context) error {
 		return err
 	}
 	if err = f.awaitGathered(ctx, target); err != nil {
-		if goOnErr := f.goOn(context.WithoutCancel(ctx), target); goOnErr != nil {
+		// The flock goes on even when the leader's step was cancelled.
+		goOnCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), ownDeadline)
+		defer cancel()
+		if goOnErr := f.goOn(goOnCtx, target); goOnErr != nil {
 			return errors.Join(err, goOnErr)
 		}
 		return err

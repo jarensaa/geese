@@ -12,34 +12,36 @@ import (
 )
 
 func TestRolloutRequiresSettledDeployment(t *testing.T) {
-	rollingOut := true
-	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
-		status := 200
-		body := ""
-		if r.Header.Get("Authorization") != "Bearer test-token" {
-			status = 401
-		}
-		switch r.URL.Path {
-		case "/apis/apps/v1/namespaces/birds/deployments/flock":
-			if rollingOut {
-				body = `{"metadata":{"generation":2},"spec":{"replicas":2},"status":{"observedGeneration":2,"updatedReplicas":1,"readyReplicas":2}}`
-			} else {
-				body = `{"metadata":{"generation":2},"spec":{"replicas":2},"status":{"observedGeneration":2,"updatedReplicas":2,"readyReplicas":2}}`
+	for _, stage := range []struct {
+		name   string
+		status string
+		calm   bool
+	}{
+		{"new replicas still starting", `"replicas":3,"updatedReplicas":1,"readyReplicas":2`, false},
+		// The last step of a surge: every replica the spec asks for is new and
+		// ready, and an old one is still running.
+		{"an old replica still running", `"replicas":3,"updatedReplicas":2,"readyReplicas":2`, false},
+		{"settled", `"replicas":2,"updatedReplicas":2,"readyReplicas":2`, true},
+	} {
+		client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			status := 200
+			body := ""
+			if r.Header.Get("Authorization") != "Bearer test-token" {
+				status = 401
 			}
-		default:
-			status = 404
+			switch r.URL.Path {
+			case "/apis/apps/v1/namespaces/birds/deployments/flock":
+				body = `{"metadata":{"generation":2},"spec":{"replicas":2},"status":{"observedGeneration":2,` + stage.status + `}}`
+			default:
+				status = 404
+			}
+			return &http.Response{StatusCode: status, Status: fmt.Sprint(status), Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header)}, nil
+		})}
+		gate := &Rollout{Client: client, Host: "https://kubernetes.test", Namespace: "birds", Deployment: "flock", Token: "test-token"}
+		calm, err := gate.Calm(context.Background())
+		if err != nil || calm != stage.calm {
+			t.Errorf("%s: calm=%v err=%v, expected calm=%v", stage.name, calm, err, stage.calm)
 		}
-		return &http.Response{StatusCode: status, Status: fmt.Sprint(status), Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header)}, nil
-	})}
-	gate := &Rollout{Client: client, Host: "https://kubernetes.test", Namespace: "birds", Deployment: "flock", Token: "test-token"}
-	ready, err := gate.Calm(context.Background())
-	if err != nil || ready {
-		t.Fatalf("accepted a deployment still rolling out: ready=%v err=%v", ready, err)
-	}
-	rollingOut = false
-	ready, err = gate.Calm(context.Background())
-	if err != nil || !ready {
-		t.Fatalf("rejected a settled deployment: ready=%v err=%v", ready, err)
 	}
 }
 

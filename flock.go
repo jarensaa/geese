@@ -54,8 +54,11 @@ type Capability struct {
 
 // Migrator is the application's migrations: geese decides when to run them,
 // and the migrator runs them. Version reads the schema version applied, in
-// the transaction given; MigrateTo migrates to exactly the target. Package
-// goose is a Migrator for pressly/goose.
+// the transaction given; MigrateTo migrates to exactly the target. Two calls of
+// MigrateTo may overlap, as when a leader's lock went with its connection while
+// it migrated and another took over: they must apply each migration once, as a
+// lock held while migrating does. Package goose is a Migrator for
+// pressly/goose.
 type Migrator interface {
 	Version(ctx context.Context, tx *sql.Tx) (int64, error)
 	MigrateTo(ctx context.Context, db *sql.DB, target int64) error
@@ -87,7 +90,7 @@ var (
 	// flock: its lease lapsed, or it can't serve the schema or capabilities
 	// the flock has. It serves again once a honk is heard.
 	ErrGrounded = errors.New("geese: grounded, without a place in the flock")
-	// ErrMigrating is the answer to work held longer than holdLimit while
+	// ErrMigrating is the answer to work held longer than a minute while
 	// the flock migrates.
 	ErrMigrating = errors.New("geese: the flock is migrating")
 	// ErrInactive is the answer to a feature whose capability isn't on yet
@@ -365,7 +368,8 @@ func (f *Flock) Capabilities(ctx context.Context) (Capabilities, error) {
 	if err = tx.Commit(); err != nil {
 		return Capabilities{}, err
 	}
-	f.version.Store(version)
+	// The version this goose serves isn't stored here: a honk stores it before
+	// held work resumes, and this read's snapshot may be older than that honk.
 	return Capabilities{Active: slices.DeleteFunc(active, func(name string) bool { return f.retired[name] }), OldestPage: formatFloor(floor)}, nil
 }
 

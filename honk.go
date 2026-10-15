@@ -135,6 +135,7 @@ func (f *Flock) coordinated(ctx context.Context) (*sql.Tx, int64, error) {
 // Fly honks on its own; Honk is exported for tests and reconciliation.
 func (f *Flock) Honk(ctx context.Context) error {
 	honked := time.Now()
+	epoch := f.epoch()
 	tx, version, err := f.coordinated(ctx)
 	if err != nil {
 		f.ground()
@@ -187,21 +188,41 @@ func (f *Flock) Honk(ctx context.Context) error {
 	// The version is stored before held work resumes, so it runs on the new schema's code.
 	f.version.Store(version)
 	f.headingSet.Store(heading.Valid)
-	f.keepUntil(honked.Add(ownDeadline))
+	if !f.keepUntil(epoch, honked.Add(ownDeadline)) {
+		return errGroundedMidHonk
+	}
 	if !migrating {
 		f.endGathering()
 	}
 	return nil
 }
 
-// keepUntil keeps this goose in the air until the deadline, measured from
-// before its honk on this process's own monotonic clock, so a stalled honk
-// grounds it before the flock counts it gone, whatever the database's clock says.
-func (f *Flock) keepUntil(deadline time.Time) {
+// errGroundedMidHonk is why a honk didn't put its goose back in the air: the
+// goose was grounded while it honked, so what the honk said, such as that the
+// goose had gathered, may no longer be true. The next honk says it again.
+var errGroundedMidHonk = errors.New("geese: grounded while honking")
+
+// epoch is how many times this goose's place has changed: a honk keeps it in
+// the air only if nothing else did since the honk began.
+func (f *Flock) epoch() uint64 {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	return f.leaseEpoch
+}
+
+// keepUntil keeps this goose in the air until the deadline, measured from
+// before its honk on this process's own monotonic clock, so a stalled honk
+// grounds it before the flock counts it gone, whatever the database's clock
+// says. It doesn't, and reports false, if the goose's place has changed since
+// epoch.
+func (f *Flock) keepUntil(epoch uint64, deadline time.Time) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.leaseEpoch != epoch {
+		return false
+	}
 	f.leaseEpoch++
-	epoch := f.leaseEpoch
+	kept := f.leaseEpoch
 	if f.leaseTimer != nil {
 		f.leaseTimer.Stop()
 	}
@@ -210,14 +231,15 @@ func (f *Flock) keepUntil(deadline time.Time) {
 	f.leaseTimer = time.AfterFunc(time.Until(deadline), func() {
 		f.mu.Lock()
 		defer f.mu.Unlock()
-		if f.leaseEpoch == epoch {
+		if f.leaseEpoch == kept {
 			f.groundLocked()
 		}
 	})
+	return true
 }
 
-// Fly keeps this goose in the flock until ctx ends: it honks, and, when it
-// leads, migrates the schema one version at a time, switches capabilities on
+// Fly honks and leads until ctx ends: it keeps this goose's place in the
+// flock, and, when it leads, migrates the schema one version at a time, switches capabilities on
 // and raises the oldest page served. A failed migration leaves the flock's
 // heading in place for a successor to look at and retry. A goose whose honk
 // fails is grounded, and serves again once a honk is heard.
@@ -239,7 +261,9 @@ func (f *Flock) Fly(ctx context.Context) {
 			return
 		case <-time.After(interval):
 		}
-		honkCtx, cancel := context.WithTimeout(ctx, ownDeadline)
+		// A honk under way when ctx ends finishes: a goose cut off mid-honk
+		// would be grounded, cancelling the work its process is finishing.
+		honkCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), ownDeadline)
 		if err := f.Honk(honkCtx); err != nil {
 			slog.Error("geese: a honk went unheard", "error", err)
 		}
@@ -260,7 +284,9 @@ func (f *Flock) leadWhenCalm(ctx context.Context) {
 		if !f.Ready() {
 			continue
 		}
-		stepCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+		// A step is bounded by this goose staying in the air: grounding cancels
+		// it. A wall clock would cancel a slow migration every time it ran.
+		stepCtx, cancel := context.WithCancel(ctx)
 		f.mu.Lock()
 		if !f.Ready() {
 			f.mu.Unlock()
