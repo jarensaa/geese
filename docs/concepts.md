@@ -25,7 +25,11 @@ geese takes the other way: the processes agree, in the database, on when it's sa
 
 The whole stop is a few seconds. If any goose doesn't gather within thirty seconds, the leader lets the flock go on as it was and tries again later. If the leader dies mid-migration, the next one finds the heading and finishes.
 
-A migration that fails keeps the flock gathered: geese never guesses that a failed migration is safe to go back from. New work is held for a minute, then refused as unavailable, and the leader tries again every few seconds until a release fixes the migration. So a migration must be short, and transactional (goose's default): a backfill or a long index build runs in the background instead, with a [capability](capabilities.md) whose `Ready` says when it's done. A goose that can't serve where the flock is heading stays grounded, so an old image started by mistake never runs against a schema it doesn't know.
+A migration that fails leaves the schema as it was, as the flock migrates only in a transaction, so the flock goes on serving at the schema applied, and the leader logs why. It tries again after thirty seconds, then twice as long after each failure in a row, up to ten minutes; a release that fixes the migration migrates at the next try. Each try pauses the flock for a few seconds, so a migration must also be short: a backfill or a long index build runs in the background instead, with a [capability](capabilities.md) whose `Ready` says when it's done. `geese_flight` says what failed, how often, and when the next try is:
+
+```sh
+psql -c "SELECT failed_for, failures, retry_at, failure FROM geese_flight"
+``` A goose that can't serve where the flock is heading stays grounded, so an old image started by mistake never runs against a schema it doesn't know.
 
 ## Capabilities and the oldest page served
 

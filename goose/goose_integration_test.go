@@ -7,6 +7,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"testing/fstest"
 	"time"
 
 	"github.com/jarensaa/geese"
@@ -107,5 +108,26 @@ func TestMigratingTwiceAtOnceAppliesOnce(t *testing.T) {
 	}
 	if applied != 2 {
 		t.Fatalf("applied %d migrations, expected 2", applied)
+	}
+}
+
+// The flock goes on after a migration fails, so it refuses one that would run
+// outside a transaction, before running anything.
+func TestTheFlockMigratesOnlyInATransaction(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	conn, _ := geesetest.Start(t, ctx)
+	unsafe := Migrations{FS: fstest.MapFS{
+		"migrations/00001_lists.sql": {Data: []byte("-- +goose Up\nCREATE TABLE lists (id bigint PRIMARY KEY);\n")},
+		"migrations/00002_index.sql": {Data: []byte("-- +goose NO TRANSACTION\n-- +goose Up\nCREATE INDEX CONCURRENTLY lists_id ON lists (id);\n")},
+	}, Dir: "migrations"}
+	if err := unsafe.MigrateTo(ctx, conn, 1); err != nil {
+		t.Fatalf("a transactional migration: %v", err)
+	}
+	if err := unsafe.MigrateTo(ctx, conn, 2); err == nil || !strings.Contains(err.Error(), "00002_index.sql runs outside a transaction") {
+		t.Fatalf("ran a migration outside a transaction: %v", err)
+	}
+	if version, err := unsafe.version(ctx, conn); err != nil || version != 1 {
+		t.Fatalf("the schema moved to %d: %v", version, err)
 	}
 }

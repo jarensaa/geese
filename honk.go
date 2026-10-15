@@ -64,7 +64,11 @@ func (f *Flock) bootstrap(ctx context.Context) error {
 		heading_for         bigint,
 		departed_at         timestamptz,
 		active_capabilities text[]      NOT NULL DEFAULT '{}',
-		oldest_page_major   bigint
+		oldest_page_major   bigint,
+		failed_for          bigint,
+		failures            integer     NOT NULL DEFAULT 0,
+		retry_at            timestamptz,
+		failure             text
 	)`); err != nil {
 		return err
 	}
@@ -240,8 +244,8 @@ func (f *Flock) keepUntil(epoch uint64, deadline time.Time) bool {
 
 // Fly honks and leads until ctx ends: it keeps this goose's place in the
 // flock, and, when it leads, migrates the schema one version at a time, switches capabilities on
-// and raises the oldest page served. A failed migration leaves the flock's
-// heading in place for a successor to look at and retry. A goose whose honk
+// and raises the oldest page served. A migration that fails lets the flock go
+// on at the schema applied, and is tried again later. A goose whose honk
 // fails is grounded, and serves again once a honk is heard.
 //
 // When ctx ends, the goose stops honking and leading, but keeps serving what

@@ -457,3 +457,103 @@ func TestGroundedMidHonkStaysGrounded(t *testing.T) {
 		t.Fatalf("the next honk didn't put it back in the air: %v", err)
 	}
 }
+
+// honking keeps a goose in the flock, as Fly does, without leading it: the
+// test leads.
+func honking(t *testing.T, ctx context.Context, live *Flock) {
+	t.Helper()
+	ctx, stop := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for ctx.Err() == nil {
+			_ = live.Honk(ctx)
+			select {
+			case <-ctx.Done():
+			case <-time.After(gatheringInterval):
+			}
+		}
+	}()
+	t.Cleanup(func() { stop(); <-done })
+}
+
+// failing is the stand-in's migrator, whose migration fails until it's fixed,
+// leaving the schema as it was, as a transactional migration does.
+type failing struct {
+	ledger
+	fixed bool
+}
+
+func (m *failing) MigrateTo(ctx context.Context, conn *sql.DB, target int64) error {
+	if !m.fixed {
+		return errors.New("constraint violated")
+	}
+	return m.ledger.MigrateTo(ctx, conn, target)
+}
+
+// A migration that fails lets the flock go on at the schema applied, and the
+// leader waits longer between each attempt until one succeeds.
+func TestAFailedMigrationLetsTheFlockGoOn(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	conn, url := standIn(t, ctx)
+	migrator := &failing{}
+	leader, err := Join(ctx, Config{DatabaseURL: url, Name: "leader", Release: "dev", Weather: ClearSkies{}, Migrator: migrator,
+		Window: Window{ServeFrom: 1, ServeTo: 2, Latest: 2}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(leader.Land)
+	honking(t, ctx, leader)
+
+	if err := leader.TryMigrate(ctx); err == nil || !strings.Contains(err.Error(), "constraint violated") {
+		t.Fatalf("a failed migration: %v", err)
+	}
+	time.Sleep(time.Second)
+	if _, release, err := leader.Admit(ctx); err != nil {
+		t.Fatalf("the flock didn't go on after a failed migration: %v", err)
+	} else {
+		release()
+	}
+	var failures int
+	var waiting bool
+	if err := conn.QueryRowContext(ctx, `SELECT failures, retry_at > clock_timestamp() + interval '20 seconds' FROM geese_flight WHERE failed_for=2 AND heading_for IS NULL`).Scan(&failures, &waiting); err != nil {
+		t.Fatalf("the failure isn't recorded: %v", err)
+	}
+	if failures != 1 || !waiting {
+		t.Fatalf("failures=%d, waiting=%v", failures, waiting)
+	}
+
+	// Until the retry is due, no leader tries again.
+	if err := leader.TryMigrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var heading sql.NullInt64
+	if err := conn.QueryRowContext(ctx, `SELECT heading_for FROM geese_flight`).Scan(&heading); err != nil || heading.Valid {
+		t.Fatalf("tried again before the retry was due: heading=%v err=%v", heading, err)
+	}
+
+	// The next failure waits twice as long.
+	if _, err := conn.ExecContext(ctx, `UPDATE geese_flight SET retry_at=clock_timestamp()`); err != nil {
+		t.Fatal(err)
+	}
+	if err := leader.TryMigrate(ctx); err == nil {
+		t.Fatal("the migration still fails")
+	}
+	if err := conn.QueryRowContext(ctx, `SELECT failures, retry_at > clock_timestamp() + interval '50 seconds' FROM geese_flight`).Scan(&failures, &waiting); err != nil || failures != 2 || !waiting {
+		t.Fatalf("failures=%d, waiting=%v, err=%v", failures, waiting, err)
+	}
+
+	// Fixed, it migrates once the retry is due, and the failure is forgotten.
+	migrator.fixed = true
+	if _, err := conn.ExecContext(ctx, `UPDATE geese_flight SET retry_at=clock_timestamp()`); err != nil {
+		t.Fatal(err)
+	}
+	if err := leader.TryMigrate(ctx); err != nil || leader.Version() != 2 {
+		t.Fatalf("migrated to %d: %v", leader.Version(), err)
+	}
+	var failed sql.NullInt64
+	if err := conn.QueryRowContext(ctx, `SELECT failed_for, failures FROM geese_flight`).Scan(&failed, &failures); err != nil || failed.Valid || failures != 0 {
+		t.Fatalf("the failure is remembered: failed_for=%v failures=%d err=%v", failed, failures, err)
+	}
+}

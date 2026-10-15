@@ -22,6 +22,7 @@ Migration tools like [goose](https://github.com/pressly/goose) apply migrations.
 - **Features switch on everywhere at once.** A capability activates when its schema is in place and every process serves it, so processes never disagree about what a client may use.
 - **Stale clients reload.** The deployment says the oldest release whose clients it still serves, so a cached web app never calls an API that's gone.
 - **Fails closed.** A process that loses contact with the database cancels its work before the others stop waiting for it.
+- **A failed migration isn't an outage.** Migrations run in a transaction, so one that fails leaves the schema as it was: the flock goes on serving, and the leader tries again later, waiting longer each time.
 - **Transport-agnostic.** `net/http` support is included; gRPC, queues and jobs use the same few calls.
 - **Guard rails in CI.** A command that holds your repository to its migration window, and a test that proves rolling migrations into a baseline changes no schema.
 
@@ -166,7 +167,7 @@ The guides are on [the documentation site](https://jarensaa.github.io/geese/), a
 - [Capabilities and the oldest page served](docs/capabilities.md)
 - [Transports: HTTP, gRPC and more](docs/transports.md)
 - [The protocol](PROTOCOL.md)
-- Design decisions: [live schema migrations](docs/decisions/0001-live-schema-migrations.md), [capabilities](docs/decisions/0002-capabilities.md), [the oldest page served](docs/decisions/0003-oldest-page-served.md)
+- Design decisions: [live schema migrations](docs/decisions/0001-live-schema-migrations.md), [capabilities](docs/decisions/0002-capabilities.md), [the oldest page served](docs/decisions/0003-oldest-page-served.md), [a failed migration](docs/decisions/0004-a-failed-migration.md)
 
 ## Status
 

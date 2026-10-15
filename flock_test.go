@@ -243,3 +243,11 @@ func TestStoppingFlyingLetsWorkInFlightFinish(t *testing.T) {
 		t.Fatal("grounding left the work in flight running")
 	}
 }
+
+func TestRetriesWaitTwiceAsLongUpToALimit(t *testing.T) {
+	for failures, want := range map[int]time.Duration{1: 30 * time.Second, 2: time.Minute, 3: 2 * time.Minute, 5: 8 * time.Minute, 6: 10 * time.Minute, 40: 10 * time.Minute} {
+		if got := retryIn(failures); got != want {
+			t.Errorf("after %d failures: %s, expected %s", failures, got, want)
+		}
+	}
+}

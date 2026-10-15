@@ -74,8 +74,9 @@ func (f *Flock) unanimous(ctx context.Context, tx *sql.Tx) error {
 // TryMigrate migrates the schema at most one version, when this goose leads,
 // the weather is calm, every goose heard serves the next version, and all of
 // them have gathered. It sets the flock's heading first, which each goose
-// hears on its next honk and gathers for; a flock that doesn't gather in time
-// goes on as it was, and the leader tries again later.
+// hears on its next honk and gathers for. A flock that doesn't gather in time,
+// or a migration that fails, goes on at the schema applied, and the next
+// attempt waits (retryAfter).
 func (f *Flock) TryMigrate(ctx context.Context) error {
 	if f.Version() >= f.window.Latest && !f.headingSet.Load() {
 		return nil
@@ -92,8 +93,9 @@ func (f *Flock) TryMigrate(ctx context.Context) error {
 		return err
 	}
 	defer tx.Rollback()
-	var heading sql.NullInt64
-	if err = tx.QueryRowContext(ctx, `SELECT heading_for FROM geese_flight WHERE id=true FOR UPDATE`).Scan(&heading); err != nil {
+	var heading, failedFor sql.NullInt64
+	var waiting bool
+	if err = tx.QueryRowContext(ctx, `SELECT heading_for,failed_for,coalesce(retry_at > clock_timestamp(),false) FROM geese_flight WHERE id=true FOR UPDATE`).Scan(&heading, &failedFor, &waiting); err != nil {
 		return err
 	}
 	// Arrived, by a leader that didn't live to say so: say so.
@@ -113,6 +115,10 @@ func (f *Flock) TryMigrate(ctx context.Context) error {
 	if heading.Valid && heading.Int64 != target {
 		return fmt.Errorf("geese: the flock is heading for %d, and the schema is at %d", heading.Int64, current)
 	}
+	// The last attempt at this version failed: the next one waits its turn.
+	if !heading.Valid && failedFor.Valid && failedFor.Int64 == target && waiting {
+		return nil
+	}
 	var unable int
 	if err = tx.QueryRowContext(ctx, `SELECT count(*) FROM geese_flock WHERE heard_until > clock_timestamp() AND (serves_from > $1 OR serves_to < $1)`, target).Scan(&unable); err != nil {
 		return err
@@ -126,19 +132,23 @@ func (f *Flock) TryMigrate(ctx context.Context) error {
 	if err = tx.Commit(); err != nil {
 		return err
 	}
-	if err = f.awaitGathered(ctx, target); err != nil {
-		// The flock goes on even when the leader's step was cancelled.
-		goOnCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), ownDeadline)
-		defer cancel()
-		if goOnErr := f.goOn(goOnCtx, target); goOnErr != nil {
-			return errors.Join(err, goOnErr)
+	if err = f.awaitGathered(ctx, target); err == nil {
+		if err = f.migrator.MigrateTo(ctx, f.db, target); err == nil {
+			return f.finishMigration(ctx, target)
 		}
-		return err
+		err = fmt.Errorf("geese: migrate to %d: %w", target, err)
 	}
-	if err = f.migrator.MigrateTo(ctx, f.db, target); err != nil {
-		return fmt.Errorf("geese: migrate to %d: %w", target, err)
+	// The flock goes on, even when the leader's step was cancelled.
+	goOnCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), ownDeadline)
+	defer cancel()
+	retry, goOnErr := f.goOn(goOnCtx, target, err)
+	if goOnErr != nil {
+		return errors.Join(err, goOnErr)
 	}
-	return f.finishMigration(ctx, target)
+	if retry > 0 {
+		return fmt.Errorf("%w (the flock goes on at %d, and tries again in %s)", err, current, retry)
+	}
+	return err
 }
 
 // awaitGathered waits until every goose heard has gathered for target.
@@ -164,21 +174,33 @@ func (f *Flock) awaitGathered(ctx context.Context, target int64) error {
 	}
 }
 
-// goOn lets the flock go on as it was when a migration couldn't start,
-// unless it was applied meanwhile.
-func (f *Flock) goOn(ctx context.Context, target int64) error {
+// goOn lets the flock go on at the schema applied when an attempt to migrate
+// to target didn't, unless it was applied meanwhile, and records why: the next
+// attempt waits the returned time.
+func (f *Flock) goOn(ctx context.Context, target int64, why error) (time.Duration, error) {
 	tx, version, err := f.coordinated(ctx)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer tx.Rollback()
 	if version >= target {
-		return nil
+		return 0, nil
 	}
-	if _, err = tx.ExecContext(ctx, `UPDATE geese_flight SET heading_for=NULL,departed_at=NULL WHERE id=true AND heading_for=$1`, target); err != nil {
-		return err
+	var failedFor sql.NullInt64
+	var failures int
+	if err = tx.QueryRowContext(ctx, `SELECT failed_for,failures FROM geese_flight WHERE id=true FOR UPDATE`).Scan(&failedFor, &failures); err != nil {
+		return 0, err
 	}
-	return tx.Commit()
+	if !failedFor.Valid || failedFor.Int64 != target {
+		failures = 0
+	}
+	failures++
+	retry := retryIn(failures)
+	if _, err = tx.ExecContext(ctx, `UPDATE geese_flight SET heading_for=NULL,departed_at=NULL,failed_for=$1,failures=$2,
+		retry_at=clock_timestamp()+$3::interval,failure=$4 WHERE id=true`, target, failures, retry.String(), why.Error()); err != nil {
+		return 0, err
+	}
+	return retry, tx.Commit()
 }
 
 // finishMigration says the flock has arrived: held work resumes on each goose's next honk.
@@ -191,7 +213,8 @@ func (f *Flock) finishMigration(ctx context.Context, target int64) error {
 	if version != target {
 		return fmt.Errorf("geese: the schema is at %d, expected %d", version, target)
 	}
-	if _, err = tx.ExecContext(ctx, `UPDATE geese_flight SET heading_for=NULL,departed_at=NULL WHERE id=true AND heading_for=$1`, target); err != nil {
+	if _, err = tx.ExecContext(ctx, `UPDATE geese_flight SET heading_for=NULL,departed_at=NULL,failed_for=NULL,failures=0,retry_at=NULL,failure=NULL
+		WHERE id=true AND heading_for=$1`, target); err != nil {
 		return err
 	}
 	if err = tx.Commit(); err != nil {

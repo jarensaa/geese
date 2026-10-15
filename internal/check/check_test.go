@@ -61,6 +61,14 @@ func TestTheMigrationWindow(t *testing.T) {
 	expect(t, Migrations(append(migrations(1, 2, 3, 4), "server/db/queries/lists.sql"), plan, layout), "")
 }
 
+func TestTheFlockMigratesOnlyInATransaction(t *testing.T) {
+	const outside = "-- +goose NO TRANSACTION\n-- +goose Up\nCREATE INDEX CONCURRENTLY lists_name ON lists (name);\n"
+	expect(t, Transactional(map[string]string{"server/db/migrations/00002_lists.sql": "-- +goose Up\nCREATE TABLE lists (id bigint);\n"}, plan), "")
+	expect(t, Transactional(map[string]string{"server/db/migrations/00002_index.sql": outside}, plan), "00002_index.sql: runs outside a transaction")
+	// The baseline is applied to an empty database, outside the flock.
+	expect(t, Transactional(map[string]string{"server/db/migrations/00001_baseline.sql": outside}, plan), "")
+}
+
 func TestCompatibilityFilesNameTheirToken(t *testing.T) {
 	window := with(func(p *geese.FlightPlan) { p.MinimumServeVersion = 3 })
 	expect(t, Compatibility(map[string]string{"server/app/compat_v0003_lists.go": "const _ = support.ServeV3"}, window, layout), "")

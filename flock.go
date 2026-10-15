@@ -54,8 +54,10 @@ type Capability struct {
 
 // Migrator is the application's migrations: geese decides when to run them,
 // and the migrator runs them. Version reads the schema version applied, in
-// the transaction given; MigrateTo migrates to exactly the target. Two calls of
-// MigrateTo may overlap, as when a leader's lock went with its connection while
+// the transaction given; MigrateTo migrates to exactly the target. A MigrateTo
+// that fails must leave the schema as it was, as a transactional migration
+// does: the flock goes on at the version applied. Two calls of MigrateTo may
+// overlap, as when a leader's lock went with its connection while
 // it migrated and another took over: they must apply each migration once, as a
 // lock held while migrating does. Package goose is a Migrator for
 // pressly/goose.
@@ -115,13 +117,32 @@ const (
 // heading, every goose holds new work, interrupts streams, lets work in flight
 // finish and says it has gathered; the leader migrates only when every goose
 // heard has. Work in flight longer than gatherGrace is cancelled; a leader
-// that waits longer than gatherTimeout lets the flock go on as it was and tries
-// again later; and work held longer than holdLimit is refused.
+// that waits longer than gatherTimeout lets the flock go on as it was; and
+// work held longer than holdLimit is refused.
+//
+// An attempt that doesn't migrate, because the flock didn't gather or the
+// migration failed, lets the flock go on at the schema applied. The next
+// attempt at that version waits retryAfter, twice as long after each failure
+// in a row, up to retryLimit, so a migration that keeps failing pauses the
+// flock only now and then.
 const (
 	gatherGrace   = 10 * time.Second
 	gatherTimeout = 30 * time.Second
 	holdLimit     = 60 * time.Second
+	retryAfter    = 30 * time.Second
+	retryLimit    = 10 * time.Minute
 )
+
+// retryIn is how long the next attempt waits after failures in a row.
+func retryIn(failures int) time.Duration {
+	wait := retryAfter
+	for range failures - 1 {
+		if wait *= 2; wait >= retryLimit {
+			return retryLimit
+		}
+	}
+	return wait
+}
 
 // admission is one unit of admitted work. A stream, such as a socket, is
 // interrupted by a migration instead of waited for; its client reconnects.

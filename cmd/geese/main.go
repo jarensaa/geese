@@ -151,6 +151,18 @@ func checkRepository(planPath string, layout check.Layout, staged bool) error {
 		return err
 	}
 	problems := check.Migrations(migrations, plan, layout)
+	sql := map[string]string{}
+	for _, path := range migrations {
+		if filepath.Dir(path) != layout.Migrations || !strings.HasSuffix(path, ".sql") {
+			continue
+		}
+		migration, err := repo.read(path)
+		if err != nil {
+			return err
+		}
+		sql[path] = string(migration)
+	}
+	problems = append(problems, check.Transactional(sql, plan)...)
 	sourcePaths, err := repo.files(layout.Source)
 	if err != nil {
 		return err

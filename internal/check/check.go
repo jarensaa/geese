@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/jarensaa/geese"
+	"github.com/jarensaa/geese/goose"
 )
 
 // Layout is where a repository keeps what the plan governs, as paths from its root.
@@ -93,6 +94,29 @@ func Migrations(paths []string, plan geese.FlightPlan, layout Layout) []string {
 }
 
 var compatName = regexp.MustCompile(`(?:^|/)compat_v0*(\d+)(?:_[a-z][a-z0-9_]*)?\.go$`)
+
+// Transactional fails each migration the flock would run, after the baseline,
+// that goose would run outside a transaction: the flock migrates only in one,
+// so that a migration that fails leaves the schema as it was, and the flock
+// goes on. The baseline is applied to an empty database, outside the flock.
+func Transactional(migrations map[string]string, plan geese.FlightPlan) []string {
+	var problems []string
+	for path, migration := range migrations {
+		_, name := split(path)
+		match := versionedName.FindStringSubmatch(name)
+		if match == nil {
+			continue
+		}
+		if version, err := strconv.ParseInt(match[1], 10, 64); err != nil || version <= plan.MinimumSupportedVersion {
+			continue
+		}
+		if !goose.Transactional([]byte(migration)) {
+			problems = append(problems, fmt.Sprintf("%s: runs outside a transaction (+goose NO TRANSACTION), which the flock won't migrate", path))
+		}
+	}
+	slices.Sort(problems)
+	return problems
+}
 
 // Compatibility checks each compatibility file: code kept for an older
 // schema version the image still serves, named compat_vNNNN.go (or

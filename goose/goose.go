@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"regexp"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/stdlib"
@@ -80,14 +81,59 @@ func (m Migrations) Version(ctx context.Context, tx *sql.Tx) (int64, error) {
 	return version, err
 }
 
-// MigrateTo applies the migrations up to and including target.
+// MigrateTo applies the migrations up to and including target. It refuses one
+// that runs outside a transaction: the flock goes on after a migration fails,
+// so a migration that fails must leave the schema as it was.
 func (m Migrations) MigrateTo(ctx context.Context, db *sql.DB, target int64) error {
+	current, err := m.version(ctx, db)
+	if err != nil {
+		return err
+	}
+	if err := m.transactional(current, target); err != nil {
+		return err
+	}
 	provider, err := m.provider(db)
 	if err != nil {
 		return err
 	}
 	_, err = provider.UpTo(ctx, target)
 	return err
+}
+
+// noTransaction is goose's annotation for a migration it runs outside a
+// transaction.
+var noTransaction = regexp.MustCompile(`(?m)^\s*--\s*\+goose\s+NO\s+TRANSACTION\b`)
+
+// Transactional says whether goose runs this SQL migration in a transaction,
+// as the flock requires: one that fails part of the way outside a transaction
+// leaves a schema no release serves.
+func Transactional(migration []byte) bool { return !noTransaction.Match(migration) }
+
+// transactional refuses the migrations after from, up to target, that goose
+// would run outside a transaction.
+func (m Migrations) transactional(from, target int64) error {
+	dir, err := fs.Sub(m.FS, m.Dir)
+	if err != nil {
+		return err
+	}
+	names, err := fs.Glob(dir, "*.sql")
+	if err != nil {
+		return err
+	}
+	for _, name := range names {
+		version, err := pressly.NumericComponent(name)
+		if err != nil || version <= from || version > target {
+			continue
+		}
+		migration, err := fs.ReadFile(dir, name)
+		if err != nil {
+			return err
+		}
+		if !Transactional(migration) {
+			return fmt.Errorf("goose: %s runs outside a transaction (+goose NO TRANSACTION), and the flock migrates only in one: make it transactional, or migrate offline", name)
+		}
+	}
+	return nil
 }
 
 // version reads the ledger outside the flock, for Migrate.

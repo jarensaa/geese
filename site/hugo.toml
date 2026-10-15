@@ -79,3 +79,7 @@ enableRobotsTXT = false
   name = "The oldest page served"
   pageRef = "/docs/decisions/0003-oldest-page-served"
   weight = 30
+[[menus.decisions]]
+  name = "A failed migration"
+  pageRef = "/docs/decisions/0004-a-failed-migration"
+  weight = 40
