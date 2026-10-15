@@ -222,3 +222,24 @@ func TestHeldWorkGivesUpWhileTheFlockMigrates(t *testing.T) {
 		t.Fatalf("held work whose caller went away: %v", err)
 	}
 }
+
+// A goose that stops flying lets its work in flight finish: it's grounded
+// when it lands, or when its last honk runs out, not when it stops honking.
+func TestStoppingFlyingLetsWorkInFlightFinish(t *testing.T) {
+	live := readyFlock()
+	work, release, err := live.Admit(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	stopping, stop := context.WithCancel(context.Background())
+	stop()
+	live.Fly(stopping)
+	if work.Err() != nil || !live.Ready() {
+		t.Fatal("stopping flying cancelled the work in flight")
+	}
+	live.ground()
+	if work.Err() == nil {
+		t.Fatal("grounding left the work in flight running")
+	}
+}

@@ -223,7 +223,8 @@ func (f *Flock) Version() int64 { return f.version.Load() }
 func (f *Flock) ID() string { return f.id }
 
 // Land leaves the flock: work admitted is cancelled, and the others stop
-// waiting for this goose at once.
+// waiting for this goose at once. A process that's stopping lands after its
+// work in flight is done (see Fly).
 func (f *Flock) Land() {
 	f.ground()
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)

@@ -221,6 +221,12 @@ func (f *Flock) keepUntil(deadline time.Time) {
 // and raises the oldest page served. A failed migration leaves the flock's
 // heading in place for a successor to look at and retry. A goose whose honk
 // fails is grounded, and serves again once a honk is heard.
+//
+// When ctx ends, the goose stops honking and leading, but keeps serving what
+// its last honk allows, a few seconds at most, so a process that's stopping
+// can finish its work in flight; it's grounded once that runs out, or when it
+// lands. A process ends Fly when it starts to stop, and lands when its work is
+// done.
 func (f *Flock) Fly(ctx context.Context) {
 	go f.leadWhenCalm(ctx)
 	for {
@@ -230,7 +236,6 @@ func (f *Flock) Fly(ctx context.Context) {
 		}
 		select {
 		case <-ctx.Done():
-			f.ground()
 			return
 		case <-time.After(interval):
 		}
