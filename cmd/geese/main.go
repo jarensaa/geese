@@ -4,9 +4,11 @@
 //	geese check [--staged] [flags]   the migration window, as the plan says
 //	geese tokens [--check] [flags]   the tokens file, or whether it's current
 //
-// Paths are from the repository's root, wherever the command runs in it. A
-// pre-commit hook runs `geese check --staged`, CI `geese check` and
-// `geese tokens --check`.
+// Paths are from the repository's root, wherever the command runs in it. The
+// flight plan is flightplan.json unless --plan says otherwise, and the rest is
+// beside it: its migrations in migrations/, and the tokens file in
+// support/generated.go. A pre-commit hook runs `geese check --staged`, CI
+// `geese check` and `geese tokens --check`.
 package main
 
 import (
@@ -16,6 +18,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"strings"
 
@@ -35,26 +38,35 @@ func run(args []string) error {
 		return errors.New("usage: geese check|tokens [flags]")
 	}
 	flags := flag.NewFlagSet("geese "+args[0], flag.ContinueOnError)
-	planPath := flags.String("plan", "server/db/flightplan.json", "the flight plan")
+	planPath := flags.String("plan", "flightplan.json", "the flight plan")
+	// Unset, a path is beside the plan.
+	beside := func(set *string, name string) {
+		if *set == "" {
+			*set = path.Join(path.Dir(*planPath), name)
+		}
+	}
 	switch args[0] {
 	case "check":
 		staged := flags.Bool("staged", false, "check what's staged for commit, not the working tree")
 		layout := check.Layout{}
-		flags.StringVar(&layout.Migrations, "migrations", "server/db/migrations", "the SQL migrations")
-		flags.StringVar(&layout.Code, "code", "server/db/migrationcode", "where Go migrations would be, which aren't allowed")
-		flags.StringVar(&layout.Source, "source", "server", "where compatibility files may be")
+		flags.StringVar(&layout.Migrations, "migrations", "", "the SQL migrations (default: migrations/ beside the plan)")
+		flags.StringVar(&layout.Code, "code", "", "where Go migrations would be, which aren't allowed (default: migrationcode/ beside the plan)")
+		flags.StringVar(&layout.Source, "source", ".", "where compatibility files may be")
 		flags.StringVar(&layout.Tokens, "tokens", "support", "the package of the compile-time tokens, as compatibility files name it")
 		if err := flags.Parse(args[1:]); err != nil {
 			return err
 		}
+		beside(&layout.Migrations, "migrations")
+		beside(&layout.Code, "migrationcode")
 		return checkRepository(*planPath, layout, *staged)
 	case "tokens":
-		out := flags.String("out", "server/db/support/generated.go", "the tokens file")
+		out := flags.String("out", "", "the tokens file (default: support/generated.go beside the plan)")
 		pkg := flags.String("package", "support", "the tokens file's package")
 		verify := flags.Bool("check", false, "fail when the tokens file isn't current, instead of writing it")
 		if err := flags.Parse(args[1:]); err != nil {
 			return err
 		}
+		beside(out, "support/generated.go")
 		return tokens(*planPath, *out, *pkg, *verify)
 	}
 	return fmt.Errorf("unknown command %q: geese check|tokens", args[0])
