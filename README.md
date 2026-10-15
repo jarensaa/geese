@@ -1,94 +1,156 @@
-# geese
+<p align="center">
+  <img src="docs/assets/banner.jpg" alt="geese: distributed database schema migrations in Go" width="820">
+</p>
 
-**Documentation: [jarensaa.github.io/geese](https://jarensaa.github.io/geese/)** · [Go reference](https://pkg.go.dev/github.com/jarensaa/geese)
+<p align="center">
+  <a href="https://pkg.go.dev/github.com/jarensaa/geese"><img src="https://pkg.go.dev/badge/github.com/jarensaa/geese.svg" alt="Go Reference"></a>
+  <a href="https://github.com/jarensaa/geese/actions/workflows/ci.yml"><img src="https://github.com/jarensaa/geese/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI"></a>
+  <a href="https://github.com/jarensaa/geese/blob/main/LICENSE"><img src="https://img.shields.io/github/license/jarensaa/geese" alt="License: Apache 2.0"></a>
+</p>
 
-Live schema migrations for an application that runs as several processes on one PostgreSQL database. The processes fly as a flock: each says what it can serve, one leads, and the flock migrates only when every goose can make the journey.
+**geese runs schema migrations for Go services that run as many processes on one PostgreSQL database, during a rolling deploy, without downtime and without hand-written expand-and-contract migrations.**
 
-Migration tools like goose apply migrations; geese decides **when**. It runs inside the application, with no Job, operator or sidecar, and makes three decisions from one agreement in the database:
+[Documentation](https://jarensaa.github.io/geese/) · [How it works](docs/concepts.md) · [Adopting geese](docs/adopting.md) · [Go reference](https://pkg.go.dev/github.com/jarensaa/geese)
 
-- **When to migrate.** One version at a time, once every running process serves the next version, the rollout has settled, and every process has gathered: held new work, interrupted its streams and finished what was in flight. Work that was held then runs on the new schema's code. So a migration may drop what the previous schema's code read, without a hand-written expand-and-contract.
-- **When a feature switches on.** A capability activates for the whole deployment at once, when its schema is in place and every process serves it, so processes never disagree about what a client may use.
-- **When a page must reload.** The flock says the oldest release whose pages it still serves, so a page kept by a service worker never calls an API that's gone.
+Migration tools like [goose](https://github.com/pressly/goose) apply migrations. geese decides **when**. Your processes fly as a flock: each one says, in the database, which schema versions it can serve; one leads; and the flock migrates only once every process can make the journey and has stopped what it was doing. It runs inside your application, with no Job, operator or sidecar.
 
-## The flock
+## Features
 
-| | |
-| --- | --- |
-| **Goose** | One process. It `Join`s the flock and `Fly`s until it `Land`s. |
-| **Honk** | Every two seconds a goose says, in `geese_flock`, the schema versions and capabilities its image serves, and the protocol it speaks. A goose not heard for ten seconds has left the flock. A goose that can't honk is **grounded**: it admits no work, and cancels what it had, before the others count it gone. |
-| **Leader** | Whoever holds the leader's advisory lock, and only in **calm weather** (a Kubernetes rollout has settled). It alone migrates, switches capabilities on and raises the oldest page served. When it lands, another takes over. |
-| **Heading** | Where the flock is about to migrate to. Every goose hears it on its next honk and **gathers** for it. |
-| **Flight plan** | The migration window, kept in the repository: at most four active migrations, and the schema versions an image serves. The `geese` command holds the repository to it. |
+- **Migrations during rolling deploys.** One version at a time, once every running process serves the next version and the rollout has settled.
+- **Nothing runs old code against a new schema.** Before a migration, every process holds new requests and finishes what's in flight; held requests then run on the new code. A migration may drop what the previous release read.
+- **Leader election built in**, with PostgreSQL advisory locks. If the leader dies mid-migration, the next one finishes.
+- **Features switch on everywhere at once.** A capability activates when its schema is in place and every process serves it, so processes never disagree about what a client may use.
+- **Stale clients reload.** The deployment says the oldest release whose clients it still serves, so a cached web app never calls an API that's gone.
+- **Fails closed.** A process that loses contact with the database cancels its work before the others stop waiting for it.
+- **Transport-agnostic.** `net/http` support is included; gRPC, queues and jobs use the same few calls.
+- **Guard rails in CI.** A command that holds your repository to its migration window, and a test that proves rolling migrations into a baseline changes no schema.
 
-## Use
+## Install
 
-```go
-plan, _ := geese.ParseFlightPlan(flightplanJSON)
-flock, err := geese.Join(ctx, geese.Config{
-	DatabaseURL:  os.Getenv("DATABASE_URL"),
-	Name:         os.Getenv("POD_UID"),
-	Release:      version, // the image's SemVer release, "dev" for none
-	Window:       plan.Window(),
-	Weather:      rollout, // kube.InCluster(namespace, deployment), or geese.ClearSkies{}
-	Migrator:     goose.Migrations{FS: embeddedMigrations, Dir: "migrations"},
-	Capabilities: []geese.Capability{{Name: "comments", MinimumSchema: 7}},
-})
-if err != nil {
-	return err
-}
-defer flock.Land()
-go flock.Fly(ctx)
-
-server := &http.Server{Handler: geesehttp.Guard(flock, app)}
+```sh
+go get github.com/jarensaa/geese
 ```
 
-- Every unit of database work enters through `flock.Admit` (or `AdmitStream` for a socket or a stream). geese knows no transport: `geesehttp.Guard` does it for every HTTP request, and [transports](docs/transports.md) shows gRPC, queues and jobs.
-- Background work admits itself the same way: `ctx, release, err := flock.Admit(ctx)`.
-- `flock.Version()` is the schema version this process serves now, for code that differs between versions.
-- Capabilities: `geesehttp.Capabilities(flock)` serves what's on and the oldest page served, for clients to read; `geesehttp.Require(flock, "comments", handler)`, or `flock.Active(ctx, "comments")`, refuses a feature until it's on. See [capabilities and the oldest page served](docs/capabilities.md), with the contract a client keeps.
-- `flock.Ready()` is the health check: false while grounded.
-- To start a fresh database before the first goose joins: `goose.Migrate(ctx, url, migrations, plan, false)`. It refuses a database in use; the flock migrates that, live.
+Requires Go 1.26 or newer and PostgreSQL. Migrations are SQL files run with [pressly/goose](https://github.com/pressly/goose).
 
-### Packages
+## Quick start
+
+```go
+package main
+
+import (
+	"context"
+	"embed"
+	"net/http"
+	"os"
+
+	"github.com/jarensaa/geese"
+	"github.com/jarensaa/geese/geesehttp"
+	"github.com/jarensaa/geese/goose"
+)
+
+//go:embed migrations/*.sql
+var migrations embed.FS
+
+//go:embed flightplan.json
+var flightplan []byte
+
+func main() {
+	ctx := context.Background()
+	plan, err := geese.ParseFlightPlan(flightplan)
+	if err != nil {
+		panic(err)
+	}
+
+	// Join the flock: this process says what it serves, and stays in step with the others.
+	flock, err := geese.Join(ctx, geese.Config{
+		DatabaseURL: os.Getenv("DATABASE_URL"),
+		Name:        os.Getenv("HOSTNAME"),
+		Release:     "1.4.0", // this build's version
+		Window:      plan.Window(),
+		Weather:     geese.ClearSkies{}, // kube.InCluster(...) under Kubernetes
+		Migrator:    goose.Migrations{FS: migrations, Dir: "migrations"},
+	})
+	if err != nil {
+		panic(err)
+	}
+	defer flock.Land()
+	go flock.Fly(ctx)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /hello", hello)
+	mux.Handle("GET /api/capabilities", geesehttp.Capabilities(flock))
+
+	// Every request is admitted to the flock, so a migration waits for it.
+	if err := http.ListenAndServe(":8080", geesehttp.Guard(flock, mux)); err != nil {
+		panic(err)
+	}
+}
+
+func hello(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("hello\n")) }
+```
+
+with `flightplan.json` beside it:
+
+```json
+{"maxActiveVersions": 4, "minimumSupportedVersion": 1, "latestMigrationVersion": 1, "minimumServeVersion": 1, "maximumServeVersion": 1}
+```
+
+Initialize a fresh database once, before the first process starts, with `goose.Migrate(ctx, url, goose.Migrations{FS: migrations, Dir: "migrations"}, plan, false)`. From then on, deploy new releases as usual: the flock migrates when it's safe. [Adopting geese](docs/adopting.md) walks through the rest: background work, Kubernetes, capabilities and CI.
+
+## How it works
+
+Every two seconds, each process (a *goose*) writes a row in the database saying which schema versions it serves. One goose holds an advisory lock and *leads*, but only once the deployment has settled. When every goose it hears serves the next version, the leader sets a *heading*. Every goose *gathers*: it holds new requests and finishes those in flight. The leader migrates, and the held requests run on the new code. The whole stop takes a few seconds.
+
+Read [how geese works](docs/concepts.md) for the details, and [the protocol](PROTOCOL.md) for exactly what the processes write and assume of each other.
+
+## How it compares
+
+| | Applies migrations | Knows which releases are running | Waits for in-flight work | Switches features on |
+| --- | :---: | :---: | :---: | :---: |
+| goose, golang-migrate, Flyway, Liquibase | ✓ | | | |
+| Atlas | ✓ | | | |
+| pgroll | ✓, through versioned views | | | |
+| Helm hooks, Argo sync waves | as a Job | | | |
+| Feature flags | | | | ✓ |
+| **geese** | through goose | ✓ | ✓ | ✓ |
+
+pgroll is the closest: it keeps old and new schemas usable side by side through views. geese keeps one schema, and coordinates the processes instead.
+
+## Packages
 
 | Package | |
 | --- | --- |
-| `geese` | The flock: `Join`, `Fly`, `Admit`, the flight plan. |
-| `geese/geesehttp` | For net/http: admits requests, serves the capabilities, and refuses a feature until it's on. Optional. |
-| `geese/kube` | A Kubernetes Deployment's rollout as the flock's weather. |
-| `geese/goose` | pressly/goose's SQL migrations as the flock's migrator, and migrating a fresh database. |
-| `geese/geesetest` | PostgreSQL in Docker for tests, a database per test. |
-| `geese/goose/goosetest` | Proves a rollup of migrations into a baseline changes no schema. |
-| `cmd/geese` | Holds a repository to its flight plan, and writes its compile-time tokens. |
+| [`geese`](https://pkg.go.dev/github.com/jarensaa/geese) | The flock: `Join`, `Fly`, `Admit`, `Capabilities`, and the flight plan. |
+| [`geesehttp`](https://pkg.go.dev/github.com/jarensaa/geese/geesehttp) | For `net/http`: admits requests, serves the capabilities, gates a route on a capability. |
+| [`kube`](https://pkg.go.dev/github.com/jarensaa/geese/kube) | Waits for a Kubernetes Deployment's rollout before migrating. |
+| [`goose`](https://pkg.go.dev/github.com/jarensaa/geese/goose) | pressly/goose migrations as the flock's migrator, and initializing a fresh database. |
+| [`geesetest`](https://pkg.go.dev/github.com/jarensaa/geese/geesetest) | PostgreSQL in Docker for tests, one database per test. |
+| [`goose/goosetest`](https://pkg.go.dev/github.com/jarensaa/geese/goose/goosetest) | Proves a rollup of migrations into a baseline changes no schema. |
+| [`cmd/geese`](https://pkg.go.dev/github.com/jarensaa/geese/cmd/geese) | Checks a repository against its migration window, in CI and pre-commit. |
 
-### The flight plan, in CI
+## Documentation
+
+- [How geese works](docs/concepts.md)
+- [Adopting geese](docs/adopting.md)
+- [Capabilities and the oldest page served](docs/capabilities.md)
+- [Transports: HTTP, gRPC and more](docs/transports.md)
+- [The protocol](PROTOCOL.md)
+- Design decisions: [live schema migrations](docs/decisions/0001-live-schema-migrations.md), [capabilities](docs/decisions/0002-capabilities.md), [the oldest page served](docs/decisions/0003-oldest-page-served.md)
+
+## Status
+
+geese is young. It's the coordinator of a service that runs in production, extracted into a library, and its Go API may change before 1.0. The protocol the processes speak is versioned on its own, and every change to it is safe to roll out ([the protocol](PROTOCOL.md#changing-the-protocol)).
+
+## Contributing
+
+Issues and pull requests are welcome. The integration tests need Docker:
 
 ```sh
-go run github.com/jarensaa/geese/cmd/geese check            # the migration window
-go run github.com/jarensaa/geese/cmd/geese check --staged   # in a pre-commit hook
-go run github.com/jarensaa/geese/cmd/geese tokens --check   # the compile-time tokens are current
+go test ./...                    # unit tests
+go test -tags integration ./...  # against PostgreSQL in Docker
 ```
 
-`server/db/flightplan.json`:
+## License
 
-```json
-{"maxActiveVersions": 4, "minimumSupportedVersion": 1, "latestMigrationVersion": 3, "minimumServeVersion": 2, "maximumServeVersion": 3}
-```
-
-`geese tokens` writes a constant for each schema version the image serves (`ServeV2`) and each active migration (`MigrateV1`). Code kept for an older schema lives in files named `compat_v0002.go` that name its token (`const _ = support.ServeV2`); raising the window's floor removes the token, and the build fails until the old code is deleted. Before a fifth migration, the chain is rolled into a new baseline, and `goosetest.RollupKeepsSchema` proves, in CI, that the rollup builds exactly the schema main's migrations did.
-
-## Rules of the flock
-
-- **One flock to a database.** Its tables (`geese_flock`, `geese_flight`) live beside the application's, outside its migrations, and its advisory locks are database-wide.
-- **PostgreSQL only.** It relies on advisory locks, `clock_timestamp()` and the catalog.
-- **Every goose speaks one protocol.** A goose writes the protocol it speaks with every honk, and a leader decides nothing while it hears a goose of another protocol, or a pod of the coordinator geese came from. See [PROTOCOL.md](PROTOCOL.md).
-- **Never migrate a database in use from outside the flock.** The flock migrates it. Offline migration is for recovery, with everything stopped.
-- **A rollback image must serve the schema already applied.** Databases don't go backwards.
-
-## Documents
-
-- [PROTOCOL.md](PROTOCOL.md): the tables, what each goose may assume of the others, and how a protocol changes.
-- [Adopting geese](docs/adopting.md): an application's checklist, and moving from the coordinator geese came from.
-- [Capabilities and the oldest page served](docs/capabilities.md): the server's half, and the contract a client keeps.
-- [Transports](docs/transports.md): HTTP, gRPC, and anything else.
-- Why it works the way it does: [live schema migrations](docs/decisions/0001-live-schema-migrations.md), [capabilities](docs/decisions/0002-capabilities.md), [the oldest page served](docs/decisions/0003-oldest-page-served.md).
+[Apache 2.0](https://github.com/jarensaa/geese/blob/main/LICENSE)

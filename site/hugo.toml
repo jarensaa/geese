@@ -14,6 +14,9 @@ enableRobotsTXT = false
 
 [markup.goldmark.parser]
   autoHeadingIDType = "github"
+# The README's banner and badges are HTML; the Markdown is ours.
+[markup.goldmark.renderer]
+  unsafe = true
 [markup.highlight]
   noClasses = false
 
@@ -27,6 +30,10 @@ enableRobotsTXT = false
   [[module.mounts]]
     source = "../docs"
     target = "content/docs"
+    files = ["! assets/**"]
+  [[module.mounts]]
+    source = "../docs/assets"
+    target = "static/docs/assets"
   [[module.mounts]]
     source = "static"
     target = "static"
@@ -39,6 +46,10 @@ enableRobotsTXT = false
   name = "Overview"
   pageRef = "/"
   weight = 10
+[[menus.main]]
+  name = "How it works"
+  pageRef = "/docs/concepts"
+  weight = 15
 [[menus.main]]
   name = "Adopting geese"
   pageRef = "/docs/adopting"
