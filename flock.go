@@ -1,0 +1,358 @@
+package geese
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"slices"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/stdlib"
+)
+
+// Weather says whether the flock may set out: a migration, a capability's
+// activation or a raised floor waits for calm. Under Kubernetes, the weather is
+// calm once the Deployment has rolled out every replica, so no goose of an
+// older image is still coming (package kube).
+type Weather interface {
+	Calm(context.Context) (bool, error)
+}
+
+// ClearSkies is the weather of a flock nothing else rolls out: always calm.
+// For a single process, and for tests.
+type ClearSkies struct{}
+
+func (ClearSkies) Calm(context.Context) (bool, error) { return true, nil }
+
+// Window is the schema versions an image serves, and the latest it can
+// migrate to. It comes from the flight plan (FlightPlan.Window).
+type Window struct {
+	ServeFrom int64
+	ServeTo   int64
+	Latest    int64
+}
+
+func (w Window) valid() bool {
+	return w.ServeFrom >= 1 && w.ServeTo >= w.ServeFrom && w.Latest >= w.ServeFrom && w.Latest <= w.ServeTo
+}
+
+// Capability is something the API promises once its schema is in place and
+// every goose in the flock serves it: a feature switches on for the whole
+// deployment at once. Ready may check a completed backfill or another
+// prerequisite, in the activation's transaction.
+type Capability struct {
+	Name          string
+	MinimumSchema int64
+	Ready         func(context.Context, *sql.Tx) (bool, error)
+}
+
+// Migrator is the application's migrations: geese decides when to run them,
+// and the migrator runs them. Version reads the schema version applied, in
+// the transaction given; MigrateTo migrates to exactly the target. Package
+// goose is a Migrator for pressly/goose.
+type Migrator interface {
+	Version(ctx context.Context, tx *sql.Tx) (int64, error)
+	MigrateTo(ctx context.Context, db *sql.DB, target int64) error
+}
+
+// Config is what a process brings to the flock.
+type Config struct {
+	DatabaseURL string
+	// Name says who this goose is, such as its pod's UID, for whoever reads
+	// geese_flock. Geese tell each other apart by an id of their own.
+	Name string
+	// Release is the image's release (SemVer, as the container build sets
+	// it). Its major says which pages it serves; a build that isn't a release
+	// ("dev", or a pre-release) says none.
+	Release  string
+	Window   Window
+	Weather  Weather
+	Migrator Migrator
+	// Capabilities are what this image's API promises once they're active.
+	Capabilities []Capability
+	// Retired names capabilities a baseline has made unconditional. A deployed
+	// database and older geese still name them active, so this image accepts
+	// and advertises them, but never reports them: nothing checks them any more.
+	Retired []string
+}
+
+var (
+	// ErrGrounded is the answer to work while this goose has no place in the
+	// flock: its lease lapsed, or it can't serve the schema or capabilities
+	// the flock has. It serves again once a honk is heard.
+	ErrGrounded = errors.New("geese: grounded, without a place in the flock")
+	// ErrMigrating is the answer to work held longer than holdLimit while
+	// the flock migrates.
+	ErrMigrating = errors.New("geese: the flock is migrating")
+)
+
+// How the flock keeps together. A goose honks every renewInterval, and is
+// heard for leaseFor: one that isn't heard again has left the flock. Its own
+// deadline is shorter than the flock's, so it stops its work before the others
+// count it gone. While the flock gathers for a migration, it honks every
+// gatheringInterval, so held work waits as little as possible.
+const (
+	renewInterval     = 2 * time.Second
+	gatheringInterval = 250 * time.Millisecond
+	leaseFor          = 10 * time.Second
+	ownDeadline       = 8 * time.Second
+)
+
+// A migration may change what the current schema's code relies on, so no
+// admitted work runs while one applies. Once the leader sets the flock's
+// heading, every goose holds new work, interrupts streams, lets work in flight
+// finish and says it has gathered; the leader migrates only when every goose
+// heard has. Work in flight longer than gatherGrace is cancelled; a leader
+// that waits longer than gatherTimeout lets the flock go on as it was and tries
+// again later; and work held longer than holdLimit is refused.
+const (
+	gatherGrace   = 10 * time.Second
+	gatherTimeout = 30 * time.Second
+	holdLimit     = 60 * time.Second
+)
+
+// admission is one unit of admitted work. A stream, such as a socket, is
+// interrupted by a migration instead of waited for; its client reconnects.
+type admission struct {
+	cancel context.CancelFunc
+	stream bool
+}
+
+// Flock is this process's place in the flock: one per process. Every unit
+// of database work enters through Admit or AdmitStream; a goose that can't
+// keep its place cancels what it admitted.
+type Flock struct {
+	db           *sql.DB
+	id           string
+	name         string
+	release      sql.NullInt64
+	window       Window
+	weather      Weather
+	migrator     Migrator
+	capabilities []Capability
+	retired      map[string]bool
+
+	ready        atomic.Bool
+	deadline     atomic.Pointer[time.Time]
+	version      atomic.Int64
+	headingSet   atomic.Bool
+	mu           sync.Mutex
+	leaseTimer   *time.Timer
+	leaseEpoch   uint64
+	requests     map[uint64]admission
+	nextRequest  uint64
+	leaderCancel context.CancelFunc
+	// While gathering for a migration: where the flock is heading, when the
+	// gathering began, and a channel closed when it ends, which held work
+	// waits on.
+	gatheringFor  int64
+	gatherStarted time.Time
+	resumed       chan struct{}
+}
+
+// Join takes this process's place in the flock: it checks it can serve the
+// schema the database has, makes the flock's tables if they're missing, and
+// honks once. It doesn't fly on its own: run Fly.
+func Join(ctx context.Context, config Config) (*Flock, error) {
+	if config.Weather == nil || config.Migrator == nil {
+		return nil, errors.New("geese: weather and a migrator are required")
+	}
+	if !config.Window.valid() {
+		return nil, fmt.Errorf("geese: invalid window %+v: serving from 1 or more, up to and including the latest migration", config.Window)
+	}
+	seen := map[string]bool{}
+	for _, capability := range config.Capabilities {
+		if capability.Name == "" || seen[capability.Name] || capability.MinimumSchema < 1 || capability.MinimumSchema > config.Window.Latest {
+			return nil, fmt.Errorf("geese: invalid or duplicate capability %q", capability.Name)
+		}
+		seen[capability.Name] = true
+	}
+	retired := map[string]bool{}
+	for _, name := range config.Retired {
+		if name == "" || seen[name] {
+			return nil, fmt.Errorf("geese: invalid or duplicate retired capability %q", name)
+		}
+		seen[name] = true
+		retired[name] = true
+	}
+	parsed, err := pgx.ParseConfig(config.DatabaseURL)
+	if err != nil {
+		return nil, err
+	}
+	db := stdlib.OpenDB(*parsed)
+	if err := db.PingContext(ctx); err != nil {
+		db.Close()
+		return nil, err
+	}
+	f := &Flock{db: db, id: uuid.NewString(), name: config.Name, release: ReleaseMajor(config.Release), window: config.Window, weather: config.Weather,
+		migrator: config.Migrator, capabilities: slices.Clone(config.Capabilities), retired: retired, requests: map[uint64]admission{}}
+	if err := f.bootstrap(ctx); err != nil {
+		db.Close()
+		return nil, err
+	}
+	if err := f.Honk(ctx); err != nil {
+		db.Close()
+		return nil, err
+	}
+	return f, nil
+}
+
+// Ready says whether this goose has its place: its last honk was heard, and
+// its own deadline hasn't passed. A health check reports it.
+func (f *Flock) Ready() bool {
+	deadline := f.deadline.Load()
+	return f.ready.Load() && deadline != nil && time.Now().Before(*deadline)
+}
+
+// Version is the schema version this goose serves now. It changes as the
+// flock migrates; code that differs between versions branches on it.
+func (f *Flock) Version() int64 { return f.version.Load() }
+
+// ID is this goose's id in geese_flock, which lives exactly as long as its
+// place in the flock. Soft state tied to it, such as who is connected to this
+// process, goes when the goose does.
+func (f *Flock) ID() string { return f.id }
+
+// Land leaves the flock: work admitted is cancelled, and the others stop
+// waiting for this goose at once.
+func (f *Flock) Land() {
+	f.ground()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_, _ = f.db.ExecContext(ctx, `DELETE FROM geese_flock WHERE id=$1`, f.id)
+	_ = f.db.Close()
+}
+
+// ground takes this goose out of the air: nothing is admitted, and what was
+// admitted is cancelled, until a honk is heard again.
+func (f *Flock) ground() {
+	f.mu.Lock()
+	f.groundLocked()
+	f.mu.Unlock()
+}
+
+func (f *Flock) groundLocked() {
+	f.ready.Store(false)
+	f.leaseEpoch++
+	if f.leaseTimer != nil {
+		f.leaseTimer.Stop()
+		f.leaseTimer = nil
+	}
+	for _, work := range f.requests {
+		work.cancel()
+	}
+	if f.leaderCancel != nil {
+		f.leaderCancel()
+	}
+	// Held work wakes to find the goose grounded.
+	f.endGatheringLocked()
+}
+
+/* ---------- Capabilities ---------- */
+
+// supportedNames is what this image serves: its capabilities and the retired
+// ones it guarantees.
+func (f *Flock) supportedNames() []string {
+	names := make([]string, 0, len(f.capabilities)+len(f.retired))
+	for _, capability := range f.capabilities {
+		names = append(names, capability.Name)
+	}
+	for name := range f.retired {
+		names = append(names, name)
+	}
+	slices.Sort(names)
+	return names
+}
+
+func (f *Flock) supportsCapabilities(active []string) bool {
+	supported := map[string]bool{}
+	for _, name := range f.supportedNames() {
+		supported[name] = true
+	}
+	for _, name := range active {
+		if !supported[name] {
+			return false
+		}
+	}
+	return true
+}
+
+func (f *Flock) checkActiveCapabilities(active []string, version int64) error {
+	if !f.supportsCapabilities(active) {
+		return errors.New("geese: an active capability is unsupported by this image")
+	}
+	for _, name := range active {
+		for _, capability := range f.capabilities {
+			if capability.Name == name && version < capability.MinimumSchema {
+				return fmt.Errorf("geese: capability %s requires schema %d, current schema is %d", name, capability.MinimumSchema, version)
+			}
+		}
+	}
+	return nil
+}
+
+func decodeCapabilities(encoded string) ([]string, error) {
+	var active []string
+	if err := json.Unmarshal([]byte(encoded), &active); err != nil {
+		return nil, err
+	}
+	if active == nil {
+		return []string{}, nil
+	}
+	return active, nil
+}
+
+// ActiveCapabilities reads what the flock has switched on, rather than
+// inferring it from this goose's own view of the schema. Discovery (an API's
+// capabilities endpoint) and enforcement (a handler refusing what isn't on)
+// use the same read. A read that fails, as when the request asking went away,
+// is the caller's error; only finding that this image can't serve what's
+// active grounds the goose. Honking answers for the database's health.
+func (f *Flock) ActiveCapabilities(ctx context.Context) ([]string, error) {
+	if !f.Ready() {
+		return nil, ErrGrounded
+	}
+	tx, err := f.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelRepeatableRead, ReadOnly: true})
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	version, err := f.migrator.Version(ctx, tx)
+	if err != nil {
+		return nil, err
+	}
+	var encoded string
+	if err := tx.QueryRowContext(ctx, `SELECT to_json(active_capabilities)::text FROM geese_flight WHERE id=true`).Scan(&encoded); err != nil {
+		return nil, err
+	}
+	active, err := decodeCapabilities(encoded)
+	if err != nil {
+		f.ground()
+		return nil, err
+	}
+	if err = f.checkServeVersion(version); err == nil {
+		err = f.checkActiveCapabilities(active, version)
+	}
+	if err != nil {
+		f.ground()
+		return nil, err
+	}
+	if err = tx.Commit(); err != nil {
+		return nil, err
+	}
+	f.version.Store(version)
+	return slices.DeleteFunc(active, func(name string) bool { return f.retired[name] }), nil
+}
+
+func (f *Flock) checkServeVersion(version int64) error {
+	if version < f.window.ServeFrom || version > f.window.ServeTo {
+		return fmt.Errorf("geese: database schema version %d is unsupported by this image (it serves %d–%d)", version, f.window.ServeFrom, f.window.ServeTo)
+	}
+	return nil
+}
