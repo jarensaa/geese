@@ -1,0 +1,17 @@
+{{- /* Links between the repository's Markdown files become links between pages:
+  a path relative to the file, ending in .md, is the page made from that file.
+  A link to a file that isn't a page fails the build. */ -}}
+{{- $u := urls.Parse .Destination -}}
+{{- $href := .Destination -}}
+{{- if and (not $u.IsAbs) (strings.HasSuffix $u.Path ".md") -}}
+  {{- $target := path.Clean (path.Join (path.Dir .PageInner.File.Path) $u.Path) -}}
+  {{- $target = index (dict "README.md" "/" "PROTOCOL.md" "/protocol") $target | default (printf "/%s" (strings.TrimSuffix ".md" $target)) -}}
+  {{- with site.GetPage $target -}}
+    {{- $href = .RelPermalink -}}
+    {{- with $u.Fragment }}{{ $href = printf "%s#%s" $href . }}{{ end -}}
+  {{- else -}}
+    {{- errorf "%s links to %q, which isn't a page" $.PageInner.File.Path $.Destination -}}
+  {{- end -}}
+{{- end -}}
+<a href="{{ $href }}"{{ with .Title }} title="{{ . }}"{{ end }}{{ if $u.IsAbs }} rel="noopener"{{ end }}>{{ .Text }}</a>
+{{- /**/ -}}

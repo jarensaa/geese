@@ -1,0 +1,4 @@
+{{- /* The file a page is made from, in the repository. */ -}}
+{{- with .File -}}
+  {{- index (dict "_index.md" "README.md" "protocol.md" "PROTOCOL.md") .Path | default .Path -}}
+{{- end -}}

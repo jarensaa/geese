@@ -1,0 +1,10 @@
+{{ define "main" }}
+<article class="prose">
+  <h1>{{ .Title }}</h1>
+  <ul>
+    {{- range sort .RegularPagesRecursive "RelPermalink" }}
+    <li><a href="{{ .RelPermalink }}">{{ partial "title.html" . }}</a></li>
+    {{- end }}
+  </ul>
+</article>
+{{ end }}

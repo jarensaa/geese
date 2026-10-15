@@ -1,0 +1,69 @@
+# The documentation site, built from the repository's own Markdown: README.md
+# is the home page, PROTOCOL.md the protocol, and docs/ the rest. Nothing here
+# is written twice. Build with `hugo --source site` (CI: .github/workflows/pages.yml).
+baseURL = "https://jarensaa.github.io/geese/"
+title = "geese"
+locale = "en"
+disableKinds = ["taxonomy", "term", "RSS", "sitemap"]
+enableRobotsTXT = false
+
+[params]
+  description = "Live schema migrations for a flock of processes on one PostgreSQL database."
+  repository = "https://github.com/jarensaa/geese"
+  reference = "https://pkg.go.dev/github.com/jarensaa/geese"
+
+[markup.goldmark.parser]
+  autoHeadingIDType = "github"
+[markup.highlight]
+  noClasses = false
+
+[module]
+  [[module.mounts]]
+    source = "../README.md"
+    target = "content/_index.md"
+  [[module.mounts]]
+    source = "../PROTOCOL.md"
+    target = "content/protocol.md"
+  [[module.mounts]]
+    source = "../docs"
+    target = "content/docs"
+  [[module.mounts]]
+    source = "static"
+    target = "static"
+  [[module.mounts]]
+    source = "layouts"
+    target = "layouts"
+
+# The navigation, in reading order.
+[[menus.main]]
+  name = "Overview"
+  pageRef = "/"
+  weight = 10
+[[menus.main]]
+  name = "Adopting geese"
+  pageRef = "/docs/adopting"
+  weight = 20
+[[menus.main]]
+  name = "Capabilities"
+  pageRef = "/docs/capabilities"
+  weight = 30
+[[menus.main]]
+  name = "Transports"
+  pageRef = "/docs/transports"
+  weight = 40
+[[menus.main]]
+  name = "Protocol"
+  pageRef = "/protocol"
+  weight = 50
+[[menus.decisions]]
+  name = "Live schema migrations"
+  pageRef = "/docs/decisions/0001-live-schema-migrations"
+  weight = 10
+[[menus.decisions]]
+  name = "Capabilities"
+  pageRef = "/docs/decisions/0002-capabilities"
+  weight = 20
+[[menus.decisions]]
+  name = "The oldest page served"
+  pageRef = "/docs/decisions/0003-oldest-page-served"
+  weight = 30

@@ -1,0 +1,87 @@
+@import url("chroma.css");
+
+/* A quiet documentation page: ink on paper, one green for the flock. */
+:root {
+  color-scheme: light dark;
+  --paper: #ffffff;
+  --paper-muted: #f5f6f4;
+  --ink: #18201d;
+  --ink-muted: #4c5752;
+  --line: #e1e5e2;
+  --accent: #1f6f5c;
+  --accent-soft: #e3f0ec;
+  --code: #f3f5f3;
+  --sans: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --mono: ui-monospace, Menlo, Consolas, "Liberation Mono", monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --paper: #121614;
+    --paper-muted: #181d1b;
+    --ink: #e8ece9;
+    --ink-muted: #a7b1ac;
+    --line: #2a322e;
+    --accent: #7fd1b9;
+    --accent-soft: #1c2d27;
+    --code: #1a201d;
+  }
+}
+
+* { box-sizing: border-box; }
+html { background: var(--paper); color: var(--ink); font-family: var(--sans); font-size: 16px; line-height: 1.6; -webkit-font-smoothing: antialiased; }
+body { margin: 0; min-width: 320px; }
+a { color: var(--accent); text-underline-offset: 3px; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 4px; }
+
+.bar {
+  position: sticky; top: 0; z-index: 1;
+  display: flex; align-items: center; gap: 16px;
+  padding: 10px 24px; border-bottom: 1px solid var(--line); background: var(--paper);
+}
+.mark { display: inline-flex; align-items: center; gap: 8px; color: var(--ink); font-weight: 700; font-size: 20px; text-decoration: none; letter-spacing: -0.01em; }
+.outbound { margin-left: auto; display: flex; gap: 16px; font-size: 15px; }
+.outbound a { color: var(--ink-muted); text-decoration: none; }
+.outbound a:hover { color: var(--ink); }
+
+.layout { display: grid; grid-template-columns: 220px minmax(0, 1fr); max-width: 1120px; margin: 0 auto; }
+.side { position: sticky; top: 57px; align-self: start; max-height: calc(100vh - 57px); overflow-y: auto; padding: 28px 16px 28px 24px; font-size: 15px; }
+.side ul { list-style: none; margin: 0; padding: 0; display: grid; gap: 2px; }
+.side a { display: block; padding: 6px 10px; border-radius: 6px; color: var(--ink-muted); text-decoration: none; }
+.side a:hover { background: var(--paper-muted); color: var(--ink); }
+.side a[aria-current="page"] { background: var(--accent-soft); color: var(--ink); font-weight: 600; }
+.side .group { margin: 20px 0 6px; padding: 0 10px; font-size: 12px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: var(--ink-muted); }
+
+main { padding: 28px 24px 64px; min-width: 0; }
+.prose { max-width: 760px; overflow-wrap: break-word; }
+.prose h1 { font-size: 36px; line-height: 1.2; letter-spacing: -0.02em; margin: 0 0 20px; }
+.prose h2 { font-size: 24px; line-height: 1.3; margin: 44px 0 12px; padding-top: 8px; border-top: 1px solid var(--line); }
+.prose h3 { font-size: 18px; margin: 28px 0 8px; }
+.prose h2, .prose h3 { scroll-margin-top: 72px; }
+.prose p, .prose ul, .prose ol { margin: 0 0 16px; }
+.prose li { margin: 4px 0; }
+.prose blockquote { margin: 0 0 20px; padding: 12px 16px; border-left: 3px solid var(--accent); background: var(--paper-muted); color: var(--ink-muted); border-radius: 0 6px 6px 0; }
+.prose blockquote p:last-child { margin: 0; }
+.prose code { overflow-wrap: anywhere; font-family: var(--mono); font-size: 0.88em; background: var(--code); padding: 0.1em 0.3em; border-radius: 4px; }
+.prose pre { tab-size: 4; margin: 0 0 20px; padding: 14px 16px; overflow-x: auto; border: 1px solid var(--line); border-radius: 8px; background: var(--code) !important; font-size: 14px; line-height: 1.55; }
+.prose pre code { background: none; padding: 0; font-size: inherit; }
+.prose .highlight { margin: 0 0 20px; }
+.prose .highlight pre { margin: 0; }
+.prose table { display: block; overflow-x: auto; border-collapse: collapse; margin: 0 0 20px; font-size: 15px; }
+.prose th, .prose td { text-align: left; vertical-align: top; padding: 8px 12px; border-bottom: 1px solid var(--line); }
+.prose th { font-weight: 600; }
+.prose td:first-child { white-space: nowrap; }
+.source { margin-top: 48px; padding-top: 16px; border-top: 1px solid var(--line); font-size: 14px; }
+.source a { color: var(--ink-muted); }
+
+@media (max-width: 760px) {
+  .layout { display: block; }
+  .side { position: static; max-height: none; padding: 12px 16px; border-bottom: 1px solid var(--line); }
+  .side ul { display: flex; flex-wrap: wrap; gap: 4px; }
+  .side .group { margin: 12px 0 4px; }
+  main { padding: 24px 16px 48px; }
+  .bar { padding: 10px 16px; }
+  .prose h1 { font-size: 30px; }
+}
+
+/* Tables whose header is empty (| | |) are lists of terms: no header row. */
+.prose thead:not(:has(th:not(:empty))) { display: none; }

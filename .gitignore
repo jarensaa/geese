@@ -31,3 +31,9 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
+
+# The documentation site's build
+public/
+site/public/
+site/resources/
+site/.hugo_build.lock

@@ -1,5 +1,7 @@
 # geese
 
+**Documentation: [jarensaa.github.io/geese](https://jarensaa.github.io/geese/)** · [Go reference](https://pkg.go.dev/github.com/jarensaa/geese)
+
 Live schema migrations for an application that runs as several processes on one PostgreSQL database. The processes fly as a flock: each says what it can serve, one leads, and the flock migrates only when every goose can make the journey.
 
 Migration tools like goose apply migrations; geese decides **when**. It runs inside the application, with no Job, operator or sidecar, and makes three decisions from one agreement in the database:
