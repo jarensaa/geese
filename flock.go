@@ -90,6 +90,9 @@ var (
 	// ErrMigrating is the answer to work held longer than holdLimit while
 	// the flock migrates.
 	ErrMigrating = errors.New("geese: the flock is migrating")
+	// ErrInactive is the answer to a feature whose capability isn't on yet
+	// (Require). A client reads it as "not yet", whatever the transport.
+	ErrInactive = errors.New("geese: the capability isn't on yet")
 )
 
 // How the flock keeps together. A goose honks every renewInterval, and is
@@ -308,46 +311,85 @@ func decodeCapabilities(encoded string) ([]string, error) {
 	return active, nil
 }
 
-// ActiveCapabilities reads what the flock has switched on, rather than
-// inferring it from this goose's own view of the schema. Discovery (an API's
-// capabilities endpoint) and enforcement (a handler refusing what isn't on)
-// use the same read. A read that fails, as when the request asking went away,
-// is the caller's error; only finding that this image can't serve what's
-// active grounds the goose. Honking answers for the database's health.
-func (f *Flock) ActiveCapabilities(ctx context.Context) ([]string, error) {
+// Capabilities is what the flock says to clients, as an API's capabilities
+// endpoint answers it: what's switched on, and the oldest release whose pages
+// it serves. It encodes as the JSON pages read (docs/capabilities.md).
+type Capabilities struct {
+	// Active are the capabilities switched on across the deployment, by name.
+	// A client treats a name it doesn't know, or one that isn't here, as off.
+	Active []string `json:"capabilities"`
+	// OldestPage is the oldest release whose pages the flock serves, as
+	// "8.0.0", or "" until one is set. A page of an older major release loads
+	// the current one.
+	OldestPage string `json:"oldestPage,omitempty"`
+}
+
+// Capabilities reads what the flock says to clients, in one snapshot, rather
+// than inferring it from this goose's own view of the schema. Discovery (an
+// API's capabilities endpoint, package geesehttp) and enforcement (a handler
+// refusing what isn't on) use the same read. A read that fails, as when the
+// request asking went away, is the caller's error; only finding that this
+// image can't serve what's active grounds the goose. Honking answers for the
+// database's health.
+func (f *Flock) Capabilities(ctx context.Context) (Capabilities, error) {
 	if !f.Ready() {
-		return nil, ErrGrounded
+		return Capabilities{}, ErrGrounded
 	}
 	tx, err := f.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelRepeatableRead, ReadOnly: true})
 	if err != nil {
-		return nil, err
+		return Capabilities{}, err
 	}
 	defer tx.Rollback()
 	version, err := f.migrator.Version(ctx, tx)
 	if err != nil {
-		return nil, err
+		return Capabilities{}, err
 	}
 	var encoded string
-	if err := tx.QueryRowContext(ctx, `SELECT to_json(active_capabilities)::text FROM geese_flight WHERE id=true`).Scan(&encoded); err != nil {
-		return nil, err
+	var floor sql.NullInt64
+	if err := tx.QueryRowContext(ctx, `SELECT to_json(active_capabilities)::text,oldest_page_major FROM geese_flight WHERE id=true`).Scan(&encoded, &floor); err != nil {
+		return Capabilities{}, err
 	}
 	active, err := decodeCapabilities(encoded)
 	if err != nil {
 		f.ground()
-		return nil, err
+		return Capabilities{}, err
 	}
 	if err = f.checkServeVersion(version); err == nil {
 		err = f.checkActiveCapabilities(active, version)
 	}
 	if err != nil {
 		f.ground()
-		return nil, err
+		return Capabilities{}, err
 	}
 	if err = tx.Commit(); err != nil {
-		return nil, err
+		return Capabilities{}, err
 	}
 	f.version.Store(version)
-	return slices.DeleteFunc(active, func(name string) bool { return f.retired[name] }), nil
+	return Capabilities{Active: slices.DeleteFunc(active, func(name string) bool { return f.retired[name] }), OldestPage: formatFloor(floor)}, nil
+}
+
+// ActiveCapabilities is what the flock has switched on, as Capabilities reads it.
+func (f *Flock) ActiveCapabilities(ctx context.Context) ([]string, error) {
+	capabilities, err := f.Capabilities(ctx)
+	return capabilities.Active, err
+}
+
+// Active says whether a capability is switched on across the deployment.
+func (f *Flock) Active(ctx context.Context, name string) (bool, error) {
+	active, err := f.ActiveCapabilities(ctx)
+	return slices.Contains(active, name), err
+}
+
+// Require is what a handler of any transport asks before it serves a feature:
+// nil while its capability is on, ErrInactive while it isn't, or why what's on
+// couldn't be read. The handler refuses the feature on any error, as "not yet"
+// (docs/transports.md says how, for HTTP and gRPC).
+func (f *Flock) Require(ctx context.Context, name string) error {
+	on, err := f.Active(ctx, name)
+	if err == nil && !on {
+		err = fmt.Errorf("%w: %s", ErrInactive, name)
+	}
+	return err
 }
 
 func (f *Flock) checkServeVersion(version int64) error {

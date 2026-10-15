@@ -40,9 +40,10 @@ go flock.Fly(ctx)
 server := &http.Server{Handler: geesehttp.Guard(flock, app)}
 ```
 
-- Every unit of database work enters through `flock.Admit` (or `AdmitStream` for a socket). `geesehttp.Guard` does it for every HTTP request, and answers 503 while the goose is grounded.
+- Every unit of database work enters through `flock.Admit` (or `AdmitStream` for a socket or a stream). geese knows no transport: `geesehttp.Guard` does it for every HTTP request, and [transports](docs/transports.md) shows gRPC, queues and jobs.
 - Background work admits itself the same way: `ctx, release, err := flock.Admit(ctx)`.
-- `flock.Version()` is the schema version this process serves now, for code that differs between versions. `flock.ActiveCapabilities(ctx)` and `flock.OldestPage(ctx)` are what an API's capabilities endpoint returns.
+- `flock.Version()` is the schema version this process serves now, for code that differs between versions.
+- Capabilities: `geesehttp.Capabilities(flock)` serves what's on and the oldest page served, for clients to read; `geesehttp.Require(flock, "comments", handler)`, or `flock.Active(ctx, "comments")`, refuses a feature until it's on. See [capabilities and the oldest page served](docs/capabilities.md), with the contract a client keeps.
 - `flock.Ready()` is the health check: false while grounded.
 - To start a fresh database before the first goose joins: `goose.Migrate(ctx, url, migrations, plan, false)`. It refuses a database in use; the flock migrates that, live.
 
@@ -51,13 +52,12 @@ server := &http.Server{Handler: geesehttp.Guard(flock, app)}
 | Package | |
 | --- | --- |
 | `geese` | The flock: `Join`, `Fly`, `Admit`, the flight plan. |
-| `geese/geesehttp` | Admits HTTP requests. |
+| `geese/geesehttp` | For net/http: admits requests, serves the capabilities, and refuses a feature until it's on. Optional. |
 | `geese/kube` | A Kubernetes Deployment's rollout as the flock's weather. |
 | `geese/goose` | pressly/goose's SQL migrations as the flock's migrator, and migrating a fresh database. |
 | `geese/geesetest` | PostgreSQL in Docker for tests, a database per test. |
 | `geese/goose/goosetest` | Proves a rollup of migrations into a baseline changes no schema. |
 | `cmd/geese` | Holds a repository to its flight plan, and writes its compile-time tokens. |
-| [`@jarensaa/geese`](js/) | A page's side: what the flock has switched on, and moving to the current release. |
 
 ### The flight plan, in CI
 
@@ -87,4 +87,6 @@ go run github.com/jarensaa/geese/cmd/geese tokens --check   # the compile-time t
 
 - [PROTOCOL.md](PROTOCOL.md): the tables, what each goose may assume of the others, and how a protocol changes.
 - [Adopting geese](docs/adopting.md): an application's checklist, and moving from the coordinator geese came from.
+- [Capabilities and the oldest page served](docs/capabilities.md): the server's half, and the contract a client keeps.
+- [Transports](docs/transports.md): HTTP, gRPC, and anything else.
 - Why it works the way it does: [live schema migrations](docs/decisions/0001-live-schema-migrations.md), [capabilities](docs/decisions/0002-capabilities.md), [the oldest page served](docs/decisions/0003-oldest-page-served.md).

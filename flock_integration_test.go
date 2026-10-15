@@ -349,6 +349,21 @@ func TestTheFlockCarriesOnFromTheCoordinatorGeeseCameFrom(t *testing.T) {
 	if page := oldestPage(t, ctx, flock); page != "7.0.0" {
 		t.Fatalf("the oldest page served: %q", page)
 	}
+	if said, err := flock.Capabilities(ctx); err != nil || !slices.Equal(said.Active, []string{"lists"}) || said.OldestPage != "7.0.0" {
+		t.Fatalf("what the flock says to clients: %+v %v", said, err)
+	}
+	if on, err := flock.Active(ctx, "lists"); err != nil || !on {
+		t.Fatalf("lists is on: %v %v", on, err)
+	}
+	if on, err := flock.Active(ctx, "comments"); err != nil || on {
+		t.Fatalf("comments isn't: %v %v", on, err)
+	}
+	if err := flock.Require(ctx, "lists"); err != nil {
+		t.Fatalf("requiring lists: %v", err)
+	}
+	if err := flock.Require(ctx, "comments"); !errors.Is(err, ErrInactive) {
+		t.Fatalf("requiring comments: %v", err)
+	}
 	// Carried over once: what the flock decides from then on is its own.
 	if _, err := conn.ExecContext(ctx, `UPDATE schema_upgrade_state SET active_capabilities='{}'`); err != nil {
 		t.Fatal(err)

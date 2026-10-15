@@ -4,11 +4,11 @@
 
 1. **Migrations.** SQL migrations for pressly/goose, embedded in the image (`//go:embed migrations/*.sql`), numbered from `00001_baseline.sql`. Write each one so the image before it can still serve while it applies, or so it only needs the flock to gather first: geese guarantees nothing runs the old schema's code against the new schema, not that the old image can serve it afterwards.
 2. **The flight plan.** `server/db/flightplan.json`, read by the image (`geese.ParseFlightPlan`, embedded) and by `geese check`.
-3. **Join and fly.** In `main`: `geese.Join`, `go flock.Fly(ctx)`, `defer flock.Land()`, and `geesehttp.Guard` around the HTTP handler. The process's health check is `flock.Ready()`.
+3. **Join and fly.** In `main`: `geese.Join`, `go flock.Fly(ctx)`, `defer flock.Land()`, and every request admitted: `geesehttp.Guard` around an HTTP handler, interceptors for gRPC ([transports](transports.md)). The process's health check is `flock.Ready()`.
 4. **Admit all work.** Background work (a sweep, a consumer, a socket's pings) admits itself with `flock.Admit` before it touches the database, and releases after. Long-lived work, such as a socket, is admitted with `AdmitStream`: a migration interrupts it, and its client reconnects.
 5. **Weather.** Under Kubernetes, `kube.InCluster(namespace, deployment)`, with a Role granting `get` on that Deployment and the namespace from the downward API. For a single process, `geese.ClearSkies{}`.
 6. **A fresh database.** `goose.Migrate(ctx, url, migrations, plan, false)` once, before the first goose joins: a command of the image, never a step of a rollout.
-7. **Capabilities.** An API endpoint (such as `GET /api/capabilities`, `Cache-Control: no-store`) answering `flock.ActiveCapabilities` and `flock.OldestPage`, and handlers refusing a feature whose capability isn't active. Pages read it with `@jarensaa/geese`.
+7. **Capabilities.** An endpoint answering `flock.Capabilities` (over HTTP, `geesehttp.Capabilities(flock)` at `GET /api/capabilities`), and `flock.Require` in front of every feature that waits for one. Clients keep [the contract](capabilities.md).
 8. **CI.** `geese check` and `geese tokens --check` on every change; `geese check --staged` in a pre-commit hook; the integration tests on `geesetest`; and, when a pull request deletes, edits or renames a migration main has, `goosetest.RollupKeepsSchema` against main's migrations from the merge base.
 9. **Releases.** The image's version is its SemVer release, set at build time and passed as `Config.Release`, and a release that breaks the API is a major one: that's what tells older pages to reload.
 

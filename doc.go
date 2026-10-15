@@ -13,14 +13,19 @@
 // previous schema's code read, as long as no image that needs it is still
 // flying.
 //
-// The same agreement switches capabilities on for the whole deployment at once
-// (ActiveCapabilities), and says the oldest release whose pages the flock still
-// serves (OldestPage), so a page kept by a service worker never calls an API
-// that's gone.
+// The same agreement switches capabilities on for the whole deployment at once,
+// and says the oldest release whose pages the flock still serves, so a page
+// kept by a service worker never calls an API that's gone. Clients read both
+// from Capabilities; a handler asks Require before it serves a feature
+// (docs/capabilities.md).
 //
 // Every unit of database work enters through Admit, or AdmitStream for a
-// socket; package geesehttp does it for HTTP. A goose that loses its place
-// cancels what it admitted before the flock counts it gone.
+// stream. A goose that loses its place cancels what it admitted before the
+// flock counts it gone.
+//
+// geese knows no transport: Admit, Capabilities and Require, with the errors
+// ErrGrounded, ErrMigrating and ErrInactive, are all a transport needs. Package
+// geesehttp is an adapter for net/http; docs/transports.md shows gRPC.
 //
 // geese decides when; the application's migrator runs the migrations (package
 // goose adapts pressly/goose). The flight plan (FlightPlan) bounds how many
