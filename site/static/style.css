@@ -86,9 +86,7 @@ main { padding: 28px 24px 64px; min-width: 0; }
 /* Tables whose header is empty (| | |) are lists of terms: no header row. */
 .prose thead:not(:has(th:not(:empty))) { display: none; }
 
-/* The README's banner and badges. */
-.prose p[align="center"] { text-align: center; }
-.prose img { max-width: 100%; height: auto; }
-.prose p[align="center"]:first-child img { border-radius: 12px; }
-.prose p[align="center"] a { text-decoration: none; }
-.prose p[align="center"] a + a { margin-left: 4px; }
+/* The home page opens with the banner, and its first paragraph is the pitch. */
+.hero { margin: 0 0 24px; }
+.hero img { display: block; width: 100%; height: auto; border-radius: 12px; }
+.home > p:first-of-type { font-size: 19px; font-weight: 600; line-height: 1.5; }

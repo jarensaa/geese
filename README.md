@@ -10,7 +10,7 @@
 
 **geese runs schema migrations for Go services that run as many processes on one PostgreSQL database, during a rolling deploy, without downtime and without hand-written expand-and-contract migrations.**
 
-[Documentation](https://jarensaa.github.io/geese/) · [How it works](docs/concepts.md) · [Adopting geese](docs/adopting.md) · [Go reference](https://pkg.go.dev/github.com/jarensaa/geese)
+[Documentation](https://jarensaa.github.io/geese/) · [Getting started](docs/getting-started.md) · [Go reference](https://pkg.go.dev/github.com/jarensaa/geese)
 
 Migration tools like [goose](https://github.com/pressly/goose) apply migrations. geese decides **when**. Your processes fly as a flock: each one says, in the database, which schema versions it can serve; one leads; and the flock migrates only once every process can make the journey and has stopped what it was doing. It runs inside your application, with no Job, operator or sidecar.
 
@@ -35,14 +35,20 @@ Requires Go 1.26 or newer and PostgreSQL. Migrations are SQL files run with [pre
 
 ## Quick start
 
+A service with one migration, from [`examples/quickstart`](examples/quickstart):
+
 ```go
 package main
 
 import (
+	"cmp"
 	"context"
 	"embed"
+	"errors"
 	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
 
 	"github.com/jarensaa/geese"
 	"github.com/jarensaa/geese/geesehttp"
@@ -50,53 +56,74 @@ import (
 )
 
 //go:embed migrations/*.sql
-var migrations embed.FS
+var migrationFS embed.FS
 
 //go:embed flightplan.json
 var flightplan []byte
 
 func main() {
 	ctx := context.Background()
+	url := os.Getenv("DATABASE_URL")
 	plan, err := geese.ParseFlightPlan(flightplan)
 	if err != nil {
 		panic(err)
 	}
+	migrations := goose.Migrations{FS: migrationFS, Dir: "migrations"}
+
+	// "init" sets up an empty database, once, before the first process starts.
+	if len(os.Args) > 1 && os.Args[1] == "init" {
+		if err := goose.Migrate(ctx, url, migrations, plan, false); err != nil {
+			panic(err)
+		}
+		return
+	}
 
 	// Join the flock: this process says what it serves, and stays in step with the others.
 	flock, err := geese.Join(ctx, geese.Config{
-		DatabaseURL: os.Getenv("DATABASE_URL"),
+		DatabaseURL: url,
 		Name:        os.Getenv("HOSTNAME"),
-		Release:     "1.4.0", // this build's version
+		Release:     "1.0.0", // this build's version
 		Window:      plan.Window(),
 		Weather:     geese.ClearSkies{}, // kube.InCluster(...) under Kubernetes
-		Migrator:    goose.Migrations{FS: migrations, Dir: "migrations"},
+		Migrator:    migrations,
 	})
 	if err != nil {
 		panic(err)
 	}
 	defer flock.Land()
-	go flock.Fly(ctx)
+
+	// Fly until the process is told to stop.
+	stopping, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	go flock.Fly(stopping)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /hello", hello)
 	mux.Handle("GET /api/capabilities", geesehttp.Capabilities(flock))
 
 	// Every request is admitted to the flock, so a migration waits for it.
-	if err := http.ListenAndServe(":8080", geesehttp.Guard(flock, mux)); err != nil {
-		panic(err)
-	}
+	server := &http.Server{Addr: cmp.Or(os.Getenv("ADDR"), ":8080"), Handler: geesehttp.Guard(flock, mux)}
+	go func() {
+		if err := server.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
+			panic(err)
+		}
+	}()
+
+	// When told to stop, finish the requests in flight, then land.
+	<-stopping.Done()
+	_ = server.Shutdown(ctx)
 }
 
 func hello(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("hello\n")) }
 ```
 
-with `flightplan.json` beside it:
+with its flight plan, `flightplan.json`, beside it:
 
 ```json
 {"maxActiveVersions": 4, "minimumSupportedVersion": 1, "latestMigrationVersion": 1, "minimumServeVersion": 1, "maximumServeVersion": 1}
 ```
 
-Initialize a fresh database once, before the first process starts, with `goose.Migrate(ctx, url, goose.Migrations{FS: migrations, Dir: "migrations"}, plan, false)`. From then on, deploy new releases as usual: the flock migrates when it's safe. [Adopting geese](docs/adopting.md) walks through the rest: background work, Kubernetes, capabilities and CI.
+Run `quickstart init` once to set up an empty database, then start as many processes as you like (`ADDR` gives each its own port). From then on, deploy new releases as usual: the flock migrates when it's safe. [Getting started](docs/getting-started.md) runs it and ships a second release; [adopting geese](docs/adopting.md) covers the rest: background work, Kubernetes, capabilities and CI.
 
 ## How it works
 
@@ -131,6 +158,9 @@ pgroll is the closest: it keeps old and new schemas usable side by side through 
 
 ## Documentation
 
+The guides are on [the documentation site](https://jarensaa.github.io/geese/), and in [`docs/`](docs):
+
+- [Getting started](docs/getting-started.md)
 - [How geese works](docs/concepts.md)
 - [Adopting geese](docs/adopting.md)
 - [Capabilities and the oldest page served](docs/capabilities.md)

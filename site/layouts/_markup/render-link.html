@@ -4,13 +4,14 @@
 {{- $u := urls.Parse .Destination -}}
 {{- $href := .Destination -}}
 {{- if and (not $u.IsAbs) (strings.HasSuffix $u.Path ".md") -}}
-  {{- $target := path.Clean (path.Join (path.Dir .PageInner.File.Path) $u.Path) -}}
-  {{- $target = index (dict "README.md" "/" "PROTOCOL.md" "/protocol") $target | default (printf "/%s" (strings.TrimSuffix ".md" $target)) -}}
-  {{- with site.GetPage $target -}}
+  {{- $target := path.Clean (path.Join (path.Dir (partial "source.html" .PageInner)) $u.Path) -}}
+  {{- $page := false -}}
+  {{- range site.Pages }}{{ if eq (partial "source.html" .) $target }}{{ $page = . }}{{ end }}{{ end -}}
+  {{- with $page -}}
     {{- $href = .RelPermalink -}}
     {{- with $u.Fragment }}{{ $href = printf "%s#%s" $href . }}{{ end -}}
   {{- else -}}
-    {{- errorf "%s links to %q, which isn't a page" $.PageInner.File.Path $.Destination -}}
+    {{- errorf "%s links to %q, which isn't a page" (partial "source.html" $.PageInner) $.Destination -}}
   {{- end -}}
 {{- end -}}
 <a href="{{ $href }}"{{ with .Title }} title="{{ . }}"{{ end }}{{ if $u.IsAbs }} rel="noopener"{{ end }}>{{ .Text }}</a>

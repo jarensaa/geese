@@ -1,6 +1,6 @@
 name: Pages
 
-# The documentation site, from README.md, PROTOCOL.md and docs/ (site/).
+# The documentation site, from docs/, PROTOCOL.md and its own home page (site/).
 # Pull requests build it, so a broken link fails them; main publishes it.
 on:
   pull_request:

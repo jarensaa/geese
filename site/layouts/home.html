@@ -1,5 +1,6 @@
 {{ define "main" }}
-<article class="prose">
+<article class="prose home">
+  <h1 class="hero"><img src="{{ "docs/assets/banner.jpg" | relURL }}" alt="geese: distributed database schema migrations in Go" width="1024" height="572"></h1>
   {{ .Content }}
   <footer class="source">
     <a href="{{ site.Params.repository }}/blob/main/{{ partial "source.html" . }}">{{ partial "source.html" . }} on GitHub</a>

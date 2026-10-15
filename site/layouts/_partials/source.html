@@ -1,4 +1,4 @@
-{{- /* The file a page is made from, in the repository. */ -}}
+{{- /* The file a page is made from, as a path in the repository. */ -}}
 {{- with .File -}}
-  {{- index (dict "_index.md" "README.md" "protocol.md" "PROTOCOL.md") .Path | default .Path -}}
+  {{- strings.TrimPrefix (printf "%s/" (path.Dir hugo.WorkingDir)) .Filename -}}
 {{- end -}}

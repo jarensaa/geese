@@ -1,6 +1,6 @@
-# The documentation site, built from the repository's own Markdown: README.md
-# is the home page, PROTOCOL.md the protocol, and docs/ the rest. Nothing here
-# is written twice. Build with `hugo --source site` (CI: .github/workflows/pages.yml).
+# The documentation site, built from the repository's own Markdown: docs/ and
+# PROTOCOL.md. Its home page (content/) is its own; the README is GitHub's.
+# Build with `hugo --source site` (CI: .github/workflows/pages.yml).
 baseURL = "https://jarensaa.github.io/geese/"
 title = "geese"
 locale = "en"
@@ -14,16 +14,13 @@ enableRobotsTXT = false
 
 [markup.goldmark.parser]
   autoHeadingIDType = "github"
-# The README's banner and badges are HTML; the Markdown is ours.
-[markup.goldmark.renderer]
-  unsafe = true
 [markup.highlight]
   noClasses = false
 
 [module]
   [[module.mounts]]
-    source = "../README.md"
-    target = "content/_index.md"
+    source = "content"
+    target = "content"
   [[module.mounts]]
     source = "../PROTOCOL.md"
     target = "content/protocol.md"
@@ -46,6 +43,10 @@ enableRobotsTXT = false
   name = "Overview"
   pageRef = "/"
   weight = 10
+[[menus.main]]
+  name = "Getting started"
+  pageRef = "/docs/getting-started"
+  weight = 12
 [[menus.main]]
   name = "How it works"
   pageRef = "/docs/concepts"
