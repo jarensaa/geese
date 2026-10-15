@@ -84,7 +84,7 @@ func main() {
 		Name:        os.Getenv("HOSTNAME"),
 		Release:     "1.0.0", // this build's version
 		Window:      plan.Window(),
-		Weather:     geese.ClearSkies{}, // kube.InCluster(...) under Kubernetes
+		Weather:     geese.ClearSkies{}, // under Kubernetes, the Deployment's rollout: kube.InCluster
 		Migrator:    migrations,
 	})
 	if err != nil {
@@ -123,7 +123,7 @@ with its flight plan, `flightplan.json`, beside it:
 {"maxActiveVersions": 4, "minimumSupportedVersion": 1, "latestMigrationVersion": 1, "minimumServeVersion": 1, "maximumServeVersion": 1}
 ```
 
-Run `quickstart init` once to set up an empty database, then start as many processes as you like (`ADDR` gives each its own port). From then on, deploy new releases as usual: the flock migrates when it's safe. [Getting started](docs/getting-started.md) runs it and ships a second release; [adopting geese](docs/adopting.md) covers the rest: background work, Kubernetes, capabilities and CI.
+Run `go mod tidy`, then `quickstart init` once to set up an empty database, then start as many processes as you like (`ADDR` gives each its own port). From then on, deploy new releases as usual: the flock migrates when it's safe. [Getting started](docs/getting-started.md) runs it and ships a second release; [adopting geese](docs/adopting.md) covers the rest: background work, Kubernetes, capabilities and CI.
 
 ## How it works
 

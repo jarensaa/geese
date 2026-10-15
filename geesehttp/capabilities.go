@@ -15,8 +15,9 @@ type Reader interface {
 	Capabilities(context.Context) (geese.Capabilities, error)
 }
 
-// Problem is the body of every answer here that isn't the capabilities:
-// a stable code for clients to branch on, and words for people.
+// Problem is the body of what Capabilities and Require refuse with: a stable
+// code for clients to branch on, and words for people. Guard's refusals are
+// plain text, as it stands in front of any handler.
 type Problem struct {
 	Code    string `json:"code"`
 	Message string `json:"message"`

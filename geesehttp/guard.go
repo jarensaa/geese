@@ -1,6 +1,8 @@
-// Package geesehttp admits HTTP requests to the flock: each request is work
-// the goose serving it admits, so a migration waits for it, and a goose that
-// loses its place cancels it.
+// Package geesehttp is geese for net/http. Guard admits every request to the
+// flock: each is work the goose serving it admits, so a migration waits for
+// it, and a goose that loses its place cancels it. Capabilities answers what
+// the flock says to clients, and Require refuses a route whose capability
+// isn't on.
 package geesehttp
 
 import (

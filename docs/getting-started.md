@@ -66,7 +66,7 @@ func main() {
 		Name:        os.Getenv("HOSTNAME"),
 		Release:     "1.0.0", // this build's version
 		Window:      plan.Window(),
-		Weather:     geese.ClearSkies{}, // kube.InCluster(...) under Kubernetes
+		Weather:     geese.ClearSkies{}, // under Kubernetes, the Deployment's rollout: kube.InCluster
 		Migrator:    migrations,
 	})
 	if err != nil {
@@ -112,7 +112,7 @@ CREATE TABLE greetings (
 DROP TABLE greetings;
 ```
 
-`flightplan.json`, the migration window: this release serves schema version 1, and 1 is the latest migration.
+`flightplan.json`, the flight plan: the migrations the repository has (the first, its baseline, to the latest), and the schema versions this release serves. Here that's all just version 1; [how geese works](concepts.md#the-flight-plan) explains each number.
 
 ```json
 {"maxActiveVersions": 4, "minimumSupportedVersion": 1, "latestMigrationVersion": 1, "minimumServeVersion": 1, "maximumServeVersion": 1}
@@ -127,15 +127,16 @@ What `main` does, in order:
 
 ## Run it
 
-Start PostgreSQL, and set up the empty database once:
+Fetch what the code imports, start PostgreSQL, and set up the empty database once:
 
 ```sh
+go mod tidy
 docker run -d --name geese-db -e POSTGRES_PASSWORD=postgres -p 5432:5432 postgres:17-alpine
 export DATABASE_URL="postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable"
 go run . init
 ```
 
-`init` refuses a database that's in use: from here on, only the flock migrates it. Now start two processes, as a deployment would:
+`init` migrates only an empty database: one the flock has already migrated part of the way is refused, and one that's current is left alone. From here on, only the flock migrates it. Now start two processes, as a deployment would:
 
 ```sh
 go build -o quickstart .
@@ -170,7 +171,7 @@ ALTER TABLE greetings DROP COLUMN language;
 {"maxActiveVersions": 4, "minimumSupportedVersion": 1, "latestMigrationVersion": 2, "minimumServeVersion": 1, "maximumServeVersion": 2}
 ```
 
-Code that differs between the two branches on `flock.Version()`. Set `Release` to `"1.1.0"`, build, and roll out one process at a time, the way Kubernetes would:
+Code that must differ between schema 1 and schema 2 branches on `flock.Version()`; this example has none. Set `Release` to `"1.1.0"`, build, and roll out one process at a time, the way Kubernetes would:
 
 ```sh
 go build -o quickstart .
@@ -178,14 +179,16 @@ kill %1; HOSTNAME=three ./quickstart &
 kill %2; HOSTNAME=four ADDR=:8081 ./quickstart &
 ```
 
-While a process of the old release is in the flock, nothing migrates: it can't serve schema 2. Once the last one has landed, the leader logs:
+While a process of the old release is in the flock, nothing migrates: it can't serve schema 2. Once the last one has landed, every process logs that it's gathering, and the leader that it migrated:
 
 ```
 INFO geese: gathering for a migration target=2
 INFO geese: migrated version=2
 ```
 
-Every process held new requests and finished those in flight, the leader migrated, and the held requests ran on the new schema's code. A later release raises `minimumServeVersion` to 2, and deletes the code that kept schema 1 working; [`geese check`](concepts.md#the-flight-plan) in CI says when that's due.
+Every process held new requests and finished those in flight, the leader migrated, and the held requests ran on the new schema's code. (The `oldest page served raised` line you saw when the first processes started is the flock telling clients which release they need: see [capabilities](capabilities.md).)
+
+A later release raises `minimumServeVersion` to 2, once rolling back to a release that needs schema 1 is no longer an option, and deletes the code that kept schema 1 working. [`geese check`](concepts.md#the-flight-plan) in CI keeps the window within its limits as migrations accumulate.
 
 ## Next
 

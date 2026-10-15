@@ -10,7 +10,7 @@ import (
 // release when it's done. A goose that loses its place cancels the returned
 // context before the flock counts it gone. While the flock gathers for a
 // migration, Admit waits until the new schema is in place, so the work runs on
-// the new schema's code; it gives up with ErrMigrating after holdLimit.
+// the new schema's code; it gives up with ErrMigrating after a minute.
 func (f *Flock) Admit(parent context.Context) (ctx context.Context, release func(), err error) {
 	return f.admit(parent, false)
 }
