@@ -14,8 +14,8 @@ import (
 // locks only briefly: making tables, and indexes on them; adding types,
 // sequences, schemas, enum values and comments; adding a column that's
 // nullable or has a constant default; adding a constraint NOT VALID, and
-// validating it; and dropping tables and columns, which every goose must
-// declare unused. Anything else, and anything it can't read for certain,
+// validating it in a migration of its own; and dropping tables and columns,
+// which every goose must declare unused. Anything else, and anything it can't read for certain,
 // pauses.
 func Classify(migration []byte) geese.Change {
 	up, why := upSection(string(migration))
@@ -25,6 +25,13 @@ func Classify(migration []byte) geese.Change {
 	statements, why := statementsOf(up)
 	if why != "" {
 		return geese.Change{Pause: why}
+	}
+	if len(statements) > 1 {
+		for _, statement := range statements {
+			if match := alterTable.FindStringSubmatch(statement); match != nil && validate.MatchString(match[2]) {
+				return geese.Change{Pause: "VALIDATE CONSTRAINT scans the table while holding the locks the migration's other statements took: give it a migration of its own"}
+			}
+		}
 	}
 	created := map[string]bool{}
 	var drops []string

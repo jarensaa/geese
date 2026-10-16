@@ -6,10 +6,12 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math/rand/v2"
 	"slices"
 	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/stdlib"
 )
 
@@ -76,9 +78,10 @@ func (f *Flock) unanimous(ctx context.Context, tx *sql.Tx) error {
 
 // TryMigrate migrates the schema at most one version, when this goose leads,
 // the weather is calm, and every goose heard serves the next version. It sets
-// the flock's heading first, which each goose hears on its next honk. Unless
-// code already serving keeps working through the migration (pauses), every
-// goose gathers for it, and the leader migrates once all of them have. A
+// the flock's heading first, which each goose hears on its next honk. When
+// code already serving might not keep working through the migration
+// (pauses), every goose gathers for it, and the leader migrates once all of
+// them have; otherwise it migrates while the flock serves. A
 // flock that doesn't gather in time, or a migration that fails, goes on at the
 // schema applied, and the next attempt waits (retryAfter).
 func (f *Flock) TryMigrate(ctx context.Context) error {
@@ -130,7 +133,7 @@ func (f *Flock) TryMigrate(ctx context.Context) error {
 	if unable > 0 {
 		return nil
 	}
-	why, err := f.pauses(ctx, tx, target, failedFor.Valid && failedFor.Int64 == target)
+	why, err := f.pauses(ctx, tx, target)
 	if err != nil {
 		return err
 	}
@@ -140,26 +143,19 @@ func (f *Flock) TryMigrate(ctx context.Context) error {
 	if err = tx.Commit(); err != nil {
 		return err
 	}
-	db := f.db
 	if why != "" {
 		slog.Info("geese: migrating with a pause", "target", target, "why", why)
-		err = f.awaitGathered(ctx, target)
+		if err = f.awaitGathered(ctx, target); err == nil {
+			err = f.migrator.MigrateTo(ctx, f.db, target)
+		}
 	} else {
-		// Without a pause, a migration waiting for a lock would hold up the
-		// queries queued behind it: it gives up instead, and the next attempt
-		// pauses.
 		slog.Info("geese: migrating without a pause", "target", target)
-		config := f.dbConfig.Copy()
-		config.RuntimeParams["lock_timeout"] = fmt.Sprintf("%dms", lockTimeout.Milliseconds())
-		db = stdlib.OpenDB(*config)
-		defer db.Close()
+		err = f.migrateWithoutAPause(ctx, target)
 	}
 	if err == nil {
-		if err = f.migrator.MigrateTo(ctx, db, target); err == nil {
-			return f.finishMigration(ctx, target)
-		}
-		err = fmt.Errorf("geese: migrate to %d: %w", target, err)
+		return f.finishMigration(ctx, target)
 	}
+	err = fmt.Errorf("geese: migrate to %d: %w", target, err)
 	// The flock goes on, even when the leader's step was cancelled.
 	goOnCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), ownDeadline)
 	defer cancel()
@@ -173,15 +169,40 @@ func (f *Flock) TryMigrate(ctx context.Context) error {
 	return err
 }
 
+// migrateWithoutAPause migrates while the flock serves, never holding up its
+// queries: each lock is waited for lockTimeout at most, so nothing queues long
+// behind one the migration hasn't got. A migration that didn't get a lock,
+// being transactional, changed nothing, and tries again.
+func (f *Flock) migrateWithoutAPause(ctx context.Context, target int64) error {
+	config := f.dbConfig.Copy()
+	config.RuntimeParams["lock_timeout"] = fmt.Sprintf("%dms", lockTimeout.Milliseconds())
+	db := stdlib.OpenDB(*config)
+	defer db.Close()
+	var err error
+	for range lockAttempts {
+		if err = f.migrator.MigrateTo(ctx, db, target); err == nil || !lockNotAvailable(err) {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return err
+		case <-time.After(lockRetry/2 + rand.N(lockRetry)):
+		}
+	}
+	return err
+}
+
+// lockNotAvailable says whether err is PostgreSQL giving up waiting for a lock.
+func lockNotAvailable(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "55P03"
+}
+
 // pauses says why the flock pauses for the migration to target, or nothing
 // when code already serving keeps working through it: the migrator says what
-// it changes, every goose heard declares unused what it drops, and no attempt
-// at it has failed. One that did, such as one that gave up waiting for a lock,
-// tries again with a pause.
-func (f *Flock) pauses(ctx context.Context, tx *sql.Tx, target int64, failed bool) (string, error) {
-	if failed {
-		return "the last attempt failed", nil
-	}
+// it changes, and every goose heard declares unused what it drops. A migration
+// that needs no pause never gets one, however often it's tried.
+func (f *Flock) pauses(ctx context.Context, tx *sql.Tx, target int64) (string, error) {
 	classifier, ok := f.migrator.(Classifier)
 	if !ok {
 		return "the migrator doesn't say what its migrations change", nil

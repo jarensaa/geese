@@ -28,8 +28,8 @@ CREATE TYPE mood AS ENUM ('sad', 'ok');
 ALTER TYPE mood ADD VALUE 'happy';
 CREATE SEQUENCE tickets;
 COMMENT ON TABLE lists IS 'Lists; of things';
-ALTER TABLE items ADD CONSTRAINT items_list FOREIGN KEY (list_id) REFERENCES lists (id) NOT VALID;
-ALTER TABLE items VALIDATE CONSTRAINT items_list;`, "", nil},
+ALTER TABLE items ADD CONSTRAINT items_list FOREIGN KEY (list_id) REFERENCES lists (id) NOT VALID;`, "", nil},
+		{"validating a constraint, on its own", "-- +goose Up\nALTER TABLE items VALIDATE CONSTRAINT items_list;", "", nil},
 		{"drops", `-- +goose Up
 -- The archive moved to its own table.
 ALTER TABLE lists DROP COLUMN archived;
@@ -45,6 +45,9 @@ CREATE TABLE "odd;name" (id bigint);`, "", nil},
 
 		{"a cascade on a table", "-- +goose Up\nDROP TABLE invites CASCADE;", "can't tell", nil},
 		{"a constraint checked as it's added", "-- +goose Up\nALTER TABLE lists ADD CONSTRAINT named UNIQUE (name);", "can't tell", nil},
+		{"validating a constraint beside another change", `-- +goose Up
+ALTER TABLE lists ADD COLUMN colour text;
+ALTER TABLE items VALIDATE CONSTRAINT items_list;`, "a migration of its own", nil},
 		{"an index on a table old code writes", "-- +goose Up\nCREATE INDEX lists_name ON lists (name);", "blocks writes", nil},
 		{"a default that isn't a constant", "-- +goose Up\nALTER TABLE lists ADD COLUMN token uuid DEFAULT gen_random_uuid();", "rewrites the table", nil},
 		{"a NOT NULL column without a default", "-- +goose Up\nALTER TABLE lists ADD COLUMN owner bigint NOT NULL;", "NOT NULL", nil},

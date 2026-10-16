@@ -155,8 +155,14 @@ const (
 	holdLimit     = 60 * time.Second
 	retryAfter    = 30 * time.Second
 	retryLimit    = 10 * time.Minute
-	// lockTimeout is how long a migration without a pause waits for a lock.
-	lockTimeout = time.Second
+	// A migration without a pause waits at most lockTimeout for a lock, so a
+	// query arriving meanwhile waits no longer behind it, and well within
+	// PostgreSQL's deadlock check, so it's the migration that gives up, never
+	// the application's transaction. It tries again after lockRetry or so,
+	// lockAttempts times, before the attempt fails.
+	lockTimeout  = 50 * time.Millisecond
+	lockRetry    = 250 * time.Millisecond
+	lockAttempts = 20
 )
 
 // retryIn is how long the next attempt waits after failures in a row.

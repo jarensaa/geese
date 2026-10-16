@@ -624,7 +624,7 @@ func TestADropWaitsForEveryGooseToDeclareItUnused(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer tx.Rollback()
-		why, err := leader.pauses(ctx, tx, 2, false)
+		why, err := leader.pauses(ctx, tx, 2)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -652,10 +652,11 @@ func (m altering) MigrateTo(ctx context.Context, conn *sql.DB, target int64) err
 	return m.ledger.MigrateTo(ctx, conn, target)
 }
 
-// A migration without a pause gives up waiting for a lock, as a long read
-// holds one, rather than hold up the queries queued behind it; the next
-// attempt pauses.
-func TestAMigrationWithoutAPauseGivesUpOnALock(t *testing.T) {
+// A migration without a pause never holds up the flock's queries: it waits
+// for a lock only a moment, so nothing queues behind it for long, and tries
+// again. One that never gets its lock fails, and its next attempt still
+// doesn't pause.
+func TestAMigrationWithoutAPauseNeverHoldsUpQueries(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 	conn, url := standIn(t, ctx)
@@ -670,6 +671,22 @@ func TestAMigrationWithoutAPauseGivesUpOnALock(t *testing.T) {
 	t.Cleanup(leader.Land)
 	honking(t, ctx, leader)
 
+	// The flock's queries on the table, timed, all along.
+	querying, stopQuerying := context.WithCancel(ctx)
+	slowest := make(chan time.Duration, 1)
+	go func() {
+		var worst time.Duration
+		for querying.Err() == nil {
+			started := time.Now()
+			if _, err := conn.ExecContext(querying, `SELECT count(*) FROM lists`); err == nil {
+				worst = max(worst, time.Since(started))
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		slowest <- worst
+	}()
+
+	// A long read holds the table throughout the first attempt.
 	reading, err := conn.BeginTx(ctx, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -677,24 +694,28 @@ func TestAMigrationWithoutAPauseGivesUpOnALock(t *testing.T) {
 	if _, err := reading.ExecContext(ctx, `SELECT * FROM lists`); err != nil {
 		t.Fatal(err)
 	}
-	started := time.Now()
 	if err := leader.TryMigrate(ctx); err == nil || !strings.Contains(err.Error(), "lock timeout") {
 		t.Fatalf("migrated through a lock: %v", err)
 	}
-	if waited := time.Since(started); waited > 5*time.Second {
-		t.Fatalf("waited %s for the lock", waited)
-	}
-	reading.Rollback()
 
+	// The next attempt doesn't pause either, and gets its lock once the read
+	// ends, while it tries.
 	if _, err := conn.ExecContext(ctx, `UPDATE geese_flight SET retry_at=clock_timestamp()`); err != nil {
 		t.Fatal(err)
 	}
+	time.AfterFunc(time.Second, func() { reading.Rollback() })
 	if err := leader.TryMigrate(ctx); err != nil || leader.Version() != 2 {
-		t.Fatalf("the attempt with a pause migrated to %d: %v", leader.Version(), err)
+		t.Fatalf("migrated to %d: %v", leader.Version(), err)
 	}
 	var pausing bool
-	if err := conn.QueryRowContext(ctx, `SELECT pausing FROM geese_flight`).Scan(&pausing); err != nil || !pausing {
-		t.Fatalf("the attempt after a failure didn't pause: %v", err)
+	if err := conn.QueryRowContext(ctx, `SELECT pausing FROM geese_flight`).Scan(&pausing); err != nil || pausing {
+		t.Fatalf("the attempt after a failure paused: %v", err)
+	}
+	stopQuerying()
+	worst := <-slowest
+	t.Logf("the slowest query took %s", worst)
+	if worst > 250*time.Millisecond {
+		t.Fatalf("a query waited %s behind the migration", worst)
 	}
 }
 

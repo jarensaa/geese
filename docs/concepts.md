@@ -28,7 +28,7 @@ A migration that needs a pause, such as a rename:
 
 The whole stop is a few seconds. If any goose doesn't gather within thirty seconds, the leader lets the flock go on as it was and tries again later. If the leader dies mid-migration, the next one finds the heading and finishes.
 
-A migration that fails leaves the schema as it was, as the flock migrates only in a transaction, so the flock goes on serving at the schema applied, and the leader logs why. It tries again after thirty seconds, then twice as long after each failure in a row, up to ten minutes; a release that fixes the migration migrates at the next try. Each try pauses the flock for a few seconds, so a migration must also be short: a backfill or a long index build runs in the background instead, with a [capability](capabilities.md) whose `Ready` says when it's done. `geese_flight` says what failed, how often, and when the next try is:
+A migration that fails leaves the schema as it was, as the flock migrates only in a transaction, so the flock goes on serving at the schema applied, and the leader logs why. It tries again after thirty seconds, then twice as long after each failure in a row, up to ten minutes; a release that fixes the migration migrates at the next try. A try of a migration that needs a pause pauses the flock for a few seconds, so such a migration must also be short: a backfill or a long index build runs in the background instead, with a [capability](capabilities.md) whose `Ready` says when it's done. `geese_flight` says what failed, how often, and when the next try is:
 
 ```sh
 psql -c "SELECT failed_for, failures, retry_at, failure FROM geese_flight"
@@ -42,11 +42,11 @@ Most migrations don't need the flock to stop: the code already serving keeps wor
 | --- | --- |
 | Making a table, and indexes on it | Nothing serving reads it yet. |
 | Adding a column that's nullable, or has a constant default | Old queries don't name it, and old inserts get the default. |
-| Adding a constraint `NOT VALID`, and validating it later | Neither checks every row while it holds up writes. |
+| Adding a constraint `NOT VALID`, and validating it in a migration of its own | Neither checks every row while it holds up writes. |
 | Adding a type, a sequence, a schema, an enum value or a comment | Nothing serving uses them. |
 | Dropping a table or a column every running image declares unused | [Below](#dropping-what-isnt-used). |
 
-Anything else pauses: a rename, an index on a table in use, a column with a default that isn't a constant or a constraint that checks every row, changes to data, and anything geese can't read for certain. A migration without a pause still takes brief locks: it waits at most a second for one, rather than hold up the queries queued behind it, and if it gives up, the next attempt pauses. Without a pause, the leader logs `migrating without a pause`; with one, it logs why.
+Anything else pauses: a rename, an index on a table in use, a column with a default that isn't a constant or a constraint that checks every row, changes to data, and anything geese can't read for certain. A migration without a pause disrupts nothing: requests aren't held, sockets stay open, and no query waits behind it for more than a moment. It still has to take brief locks, as PostgreSQL alters a table only under one, and a query arriving while the lock is held waits the milliseconds it takes. But the migration waits at most fifty milliseconds for a lock, so queries never queue behind one it's still waiting for, and lets go when it doesn't get it, trying again a moment later. A migration that can't get its locks fails ([like any other](#a-migration-step-by-step)), and is tried again later, still without a pause. Without a pause, the leader logs `migrating without a pause`; with one, it logs why.
 
 `geese check` says which migrations will pause, and why:
 
