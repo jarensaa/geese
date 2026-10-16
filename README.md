@@ -8,22 +8,23 @@
   <a href="https://github.com/jarensaa/geese/blob/main/LICENSE"><img src="https://img.shields.io/github/license/jarensaa/geese" alt="License: Apache 2.0"></a>
 </p>
 
-**geese runs schema migrations for Go services that run as many processes on one PostgreSQL database, during a rolling deploy, without downtime and without hand-written expand-and-contract migrations.**
+**geese runs schema migrations for Go services that run as many processes on one PostgreSQL database, while they serve: no downtime, no pause, no disruption, and every step of expand and contract checked.**
 
 [Documentation](https://jarensaa.github.io/geese/) · [Getting started](docs/getting-started.md) · [Go reference](https://pkg.go.dev/github.com/jarensaa/geese)
 
-Migration tools like [goose](https://github.com/pressly/goose) apply migrations. geese decides **when**. Your processes fly as a flock: each one says, in the database, which schema versions it can serve; one leads; and the flock migrates only once every process can make the journey, pausing them for a moment only when the migration could break the code they run. It runs inside your application, with no Job, operator or sidecar.
+Migration tools like [goose](https://github.com/pressly/goose) apply migrations. geese decides **when**. Your processes fly as a flock: each one says, in the database, which schema versions it can serve and what its code no longer touches; one leads; and the flock runs a migration only once every process can make the journey, and only if it keeps the code they run working. It runs inside your application, with no Job, operator or sidecar.
 
 ## Features
 
 - **Migrations during rolling deploys.** One version at a time, once every running process serves the next version and the rollout has settled.
-- **Pauses only when it must.** Adding a table or a nullable column applies while every process serves. A migration that could break running code pauses the flock instead: every process holds new requests and finishes what's in flight, and held requests then run on the new code, so nothing runs old code against a new schema.
-- **Drops without a pause, provably.** Each image declares the columns and tables its code no longer touches, and its tests run without them. Once every running image declares a column unused, dropping it needs no pause.
-- **Leader election built in**, with PostgreSQL advisory locks. If the leader dies mid-migration, the next one finishes.
+- **Zero disruption.** The flock serves throughout every migration: nothing is held, cancelled or reconnected, and no query waits behind a migration for more than a moment.
+- **Only what keeps running code working.** geese reads each migration, and runs only changes old code can't notice: new tables and nullable columns, constraints added `NOT VALID`, indexes built `CONCURRENTLY`. Anything else, `geese check` fails in CI, with why, and you make it in steps that do.
+- **Drops, provably safe.** Each image declares the columns and tables its code no longer touches, and its tests run without them. A column is dropped once every running image declares it unused.
+- **Leader election built in**, with PostgreSQL advisory locks. If the leader dies mid-migration, the next one runs it again.
 - **Features switch on everywhere at once.** A capability activates when its schema is in place and every process serves it, so processes never disagree about what a client may use.
 - **Stale clients reload.** The deployment says the oldest release whose clients it still serves, so a cached web app never calls an API that's gone.
 - **Fails closed.** A process that loses contact with the database cancels its work before the others stop waiting for it.
-- **A failed migration isn't an outage.** Migrations run in a transaction, so one that fails leaves the schema as it was: the flock goes on serving, and the leader tries again later, waiting longer each time.
+- **A failed migration changes nothing.** Migrations run in a transaction, so one that fails leaves the schema as it was, and the leader tries again later, waiting longer each time.
 - **Transport-agnostic.** `net/http` support is included; gRPC, queues and jobs use the same few calls.
 - **Guard rails in CI.** A command that holds your repository to its migration window, and a test that proves rolling migrations into a baseline changes no schema.
 
@@ -86,7 +87,7 @@ func main() {
 		Name:        os.Getenv("HOSTNAME"),
 		Release:     "1.0.0", // this build's version
 		Window:      plan.Window(),
-		Unused:      plan.Unused,        // what its code no longer touches, so dropping it needs no pause
+		Unused:      plan.Unused,        // what its code no longer touches, so the flock may drop it
 		Weather:     geese.ClearSkies{}, // under Kubernetes, the Deployment's rollout: kube.InCluster
 		Migrator:    migrations,
 	})
@@ -130,22 +131,22 @@ Run `go mod tidy`, then `quickstart init` once to set up an empty database, then
 
 ## How it works
 
-Every two seconds, each process (a *goose*) writes a row in the database saying which schema versions it serves. One goose holds an advisory lock and *leads*, but only once the deployment has settled. When every goose it hears serves the next version, the leader sets a *heading* and migrates. If the migration could break the code running, every goose first *gathers*: it holds new requests and finishes those in flight, and the held requests run on the new code once the leader has migrated. That stop takes a few seconds; most migrations don't need it.
+Every two seconds, each process (a *goose*) writes a row in the database saying which schema versions it serves. One goose holds an advisory lock and *leads*, but only once the deployment has settled. When every goose it hears serves the next version, and declares unused whatever the migration drops, the leader sets a *heading*, which keeps out a process that couldn't make the journey, and migrates while the flock serves. Each goose hears the new version on its next honk, and its code takes the new path.
 
 Read [how geese works](docs/concepts.md) for the details, and [the protocol](PROTOCOL.md) for exactly what the processes write and assume of each other.
 
 ## How it compares
 
-| | Applies migrations | Knows which releases are running | Waits for in-flight work | Switches features on |
+| | Applies migrations | Knows which releases are running | Checks a change keeps running code working | Switches features on |
 | --- | :---: | :---: | :---: | :---: |
 | goose, golang-migrate, Flyway, Liquibase | ✓ | | | |
 | Atlas | ✓ | | | |
-| pgroll | ✓, through versioned views | | | |
+| pgroll | ✓, through versioned views | | ✓, by keeping both schemas | |
 | Helm hooks, Argo sync waves | as a Job | | | |
 | Feature flags | | | | ✓ |
 | **geese** | through goose | ✓ | ✓ | ✓ |
 
-pgroll is the closest: it keeps old and new schemas usable side by side through views. geese keeps one schema, and coordinates the processes instead.
+pgroll is the closest: it keeps old and new schemas usable side by side through views. geese keeps one schema, runs only what the code running can't notice, and coordinates the processes instead.
 
 ## Packages
 
@@ -169,7 +170,7 @@ The guides are on [the documentation site](https://jarensaa.github.io/geese/), a
 - [Capabilities and the oldest page served](docs/capabilities.md)
 - [Transports: HTTP, gRPC and more](docs/transports.md)
 - [The protocol](PROTOCOL.md)
-- Design decisions: [live schema migrations](docs/decisions/0001-live-schema-migrations.md), [capabilities](docs/decisions/0002-capabilities.md), [the oldest page served](docs/decisions/0003-oldest-page-served.md), [a failed migration](docs/decisions/0004-a-failed-migration.md), [pausing only when it must](docs/decisions/0005-pausing-only-when-it-must.md)
+- Design decisions: [live schema migrations](docs/decisions/0001-live-schema-migrations.md), [capabilities](docs/decisions/0002-capabilities.md), [the oldest page served](docs/decisions/0003-oldest-page-served.md), [a failed migration](docs/decisions/0004-a-failed-migration.md), [pausing only when it must](docs/decisions/0005-pausing-only-when-it-must.md), [never pausing](docs/decisions/0006-never-pausing.md)
 
 ## Status
 

@@ -62,17 +62,10 @@ func TestTheMigrationWindow(t *testing.T) {
 	expect(t, Migrations(append(migrations(1, 2, 3, 4), "server/db/queries/lists.sql"), plan, layout), "")
 }
 
-func TestTheFlockMigratesOnlyInATransaction(t *testing.T) {
-	const outside = "-- +goose NO TRANSACTION\n-- +goose Up\nCREATE INDEX CONCURRENTLY lists_name ON lists (name);\n"
-	expect(t, Transactional(map[string]string{"server/db/migrations/00002_lists.sql": "-- +goose Up\nCREATE TABLE lists (id bigint);\n"}, plan), "")
-	expect(t, Transactional(map[string]string{"server/db/migrations/00002_index.sql": outside}, plan), "00002_index.sql: runs outside a transaction")
-	// The baseline is applied to an empty database, outside the flock.
-	expect(t, Transactional(map[string]string{"server/db/migrations/00001_baseline.sql": outside}, plan), "")
-}
-
-func TestPauses(t *testing.T) {
+func TestDisruptive(t *testing.T) {
 	declares := with(func(p *geese.FlightPlan) { p.Unused = []string{"lists.archived"} })
-	got := Pauses(map[string]string{
+	got := Disruptive(map[string]string{
+		// The baseline is applied to an empty database, outside the flock.
 		"server/db/migrations/00001_baseline.sql": "-- +goose Up\nUPDATE lists SET name = 'x';",
 		"server/db/migrations/00002_colour.sql":   "-- +goose Up\nALTER TABLE lists ADD COLUMN colour text;",
 		"server/db/migrations/00003_archive.sql":  "-- +goose Up\nALTER TABLE lists DROP COLUMN archived;",
@@ -80,10 +73,8 @@ func TestPauses(t *testing.T) {
 		"server/db/migrations/00005_rename.sql":   "-- +goose Up\nALTER TABLE lists RENAME name TO title;",
 	}, declares)
 	want := []string{
-		"00002_colour.sql needs no pause",
-		"00003_archive.sql needs no pause, once every image running declares lists.archived unused",
-		"00004_invites.sql pauses the flock: the flight plan doesn't declare invites unused",
-		`00005_rename.sql pauses the flock: geese can't tell code already serving keeps working through "ALTER TABLE lists RENAME name TO title"`,
+		"server/db/migrations/00004_invites.sql drops invites, which the flight plan doesn't declare unused",
+		`server/db/migrations/00005_rename.sql would disrupt the flock: geese can't tell code already serving keeps working through "ALTER TABLE lists RENAME name TO title": make it in steps that do`,
 	}
 	if !slices.Equal(got, want) {
 		t.Errorf("got\n%s\nwant\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))

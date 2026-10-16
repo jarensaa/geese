@@ -44,7 +44,7 @@ func main() {
 		Name:        os.Getenv("HOSTNAME"),
 		Release:     "1.0.0", // this build's version
 		Window:      plan.Window(),
-		Unused:      plan.Unused,        // what its code no longer touches, so dropping it needs no pause
+		Unused:      plan.Unused,        // what its code no longer touches, so the flock may drop it
 		Weather:     geese.ClearSkies{}, // under Kubernetes, the Deployment's rollout: kube.InCluster
 		Migrator:    migrations,
 	})

@@ -87,3 +87,7 @@ enableRobotsTXT = false
   name = "Pausing only when it must"
   pageRef = "/docs/decisions/0005-pausing-only-when-it-must"
   weight = 50
+[[menus.decisions]]
+  name = "Never pausing"
+  pageRef = "/docs/decisions/0006-never-pausing"
+  weight = 60

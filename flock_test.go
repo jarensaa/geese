@@ -10,7 +10,7 @@ import (
 )
 
 func TestGroundingCancelsWorkInFlightAndAdmitsNoMore(t *testing.T) {
-	live := &Flock{requests: map[uint64]admission{}}
+	live := &Flock{requests: map[uint64]context.CancelFunc{}}
 	live.ready.Store(true)
 	deadline := time.Now().Add(time.Minute)
 	live.deadline.Store(&deadline)
@@ -32,7 +32,7 @@ func TestGroundingCancelsWorkInFlightAndAdmitsNoMore(t *testing.T) {
 }
 
 func TestOwnDeadlineGroundsAGooseWhoseHonkIsntHeard(t *testing.T) {
-	live := &Flock{requests: map[uint64]admission{}}
+	live := &Flock{requests: map[uint64]context.CancelFunc{}}
 	live.keepUntil(live.epoch(), time.Now().Add(50*time.Millisecond))
 	ctx, release, err := live.Admit(context.Background())
 	if err != nil {
@@ -110,117 +110,11 @@ func TestRetiredCapabilityIsSupportedButNotReported(t *testing.T) {
 }
 
 func readyFlock() *Flock {
-	live := &Flock{requests: map[uint64]admission{}}
+	live := &Flock{requests: map[uint64]context.CancelFunc{}}
 	live.ready.Store(true)
 	deadline := time.Now().Add(time.Minute)
 	live.deadline.Store(&deadline)
 	return live
-}
-
-func TestGatheringHoldsNewWorkUntilTheMigrationIsApplied(t *testing.T) {
-	live := readyFlock()
-	if !live.gatherFor(11) {
-		t.Fatal("a goose with nothing running gathers at once")
-	}
-	admitted := make(chan error, 1)
-	go func() {
-		_, release, err := live.Admit(context.Background())
-		if err == nil {
-			release()
-		}
-		admitted <- err
-	}()
-	select {
-	case <-admitted:
-		t.Fatal("work was admitted while gathering for a migration")
-	case <-time.After(50 * time.Millisecond):
-	}
-	live.endGathering()
-	select {
-	case err := <-admitted:
-		if err != nil {
-			t.Fatalf("held work was refused once the migration applied: %v", err)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("held work did not resume")
-	}
-}
-
-func TestGatheringInterruptsStreamsAndWaitsForRequests(t *testing.T) {
-	live := readyFlock()
-	requestCtx, releaseRequest, err := live.Admit(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	streamCtx, releaseStream, err := live.AdmitStream(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if live.gatherFor(11) {
-		t.Fatal("gathered while work was still running")
-	}
-	select {
-	case <-streamCtx.Done():
-	case <-time.After(time.Second):
-		t.Fatal("gathering didn't interrupt the stream")
-	}
-	if requestCtx.Err() != nil {
-		t.Fatal("gathering cancelled a request within its grace")
-	}
-	releaseStream()
-	releaseRequest()
-	if !live.gatherFor(11) {
-		t.Fatal("not gathered once everything finished")
-	}
-}
-
-func TestGatheringCancelsRequestsPastTheGrace(t *testing.T) {
-	live := readyFlock()
-	ctx, release, err := live.Admit(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer release()
-	live.gatherFor(11)
-	live.mu.Lock()
-	live.gatherStarted = time.Now().Add(-gatherGrace - time.Second)
-	live.mu.Unlock()
-	live.gatherFor(11)
-	select {
-	case <-ctx.Done():
-	case <-time.After(time.Second):
-		t.Fatal("a request past the gathering's grace wasn't cancelled")
-	}
-}
-
-func TestGroundingRefusesHeldWork(t *testing.T) {
-	live := readyFlock()
-	live.gatherFor(11)
-	refused := make(chan error, 1)
-	go func() {
-		_, _, err := live.Admit(context.Background())
-		refused <- err
-	}()
-	time.Sleep(20 * time.Millisecond)
-	live.ground()
-	select {
-	case err := <-refused:
-		if err == nil {
-			t.Fatal("held work was admitted after the goose was grounded")
-		}
-	case <-time.After(time.Second):
-		t.Fatal("held work didn't wake when the goose was grounded")
-	}
-}
-
-func TestHeldWorkGivesUpWhileTheFlockMigrates(t *testing.T) {
-	live := readyFlock()
-	live.gatherFor(11)
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	if _, _, err := live.Admit(ctx); !errors.Is(err, context.Canceled) {
-		t.Fatalf("held work whose caller went away: %v", err)
-	}
 }
 
 // A goose that stops flying lets its work in flight finish: it's grounded

@@ -4,16 +4,15 @@ geese knows no transport. Everything a transport needs is in the core package:
 
 | | |
 | --- | --- |
-| `flock.Admit(ctx)` | Admits a unit of work: a request, a call, a message from a queue. A migration waits for it to finish. |
-| `flock.AdmitStream(ctx)` | Admits long-lived work: a socket, a server stream, a subscription. A migration interrupts it, and its client comes back. |
+| `flock.Admit(ctx)` | Admits a unit of work: a request, a call, a stream, a message from a queue. A goose that loses its place cancels it. |
 | `flock.Ready()` | The health check: false while the goose is grounded. |
 | `flock.Capabilities(ctx)` | What clients read: what's switched on, and the oldest release whose pages are served. |
 | `flock.Require(ctx, name)` | What a handler asks before it serves a feature. |
-| `geese.ErrGrounded`, `ErrMigrating`, `ErrInactive` | Why something was refused. Each means "not now, try again": map them to the transport's way of saying so. |
+| `geese.ErrGrounded`, `ErrInactive` | Why something was refused. Each means "not now, try again": map them to the transport's way of saying so. |
 
 Whatever the transport, the rules are the same:
 
-- **Admit before touching the database**, and release when done. Work that isn't admitted isn't waited for by a migration, and isn't cancelled when the goose is grounded.
+- **Admit before touching the database**, and release when done. Work that isn't admitted isn't cancelled when the goose is grounded, so it may run on after the flock stops counting the goose.
 - **Refuse, don't fake.** An error from `Admit` or `Require` is answered as "unavailable, try again", never with a made-up result.
 - **Clients keep [the contract](capabilities.md#on-the-client)**: what they're told in the transport's terms.
 
@@ -26,14 +25,14 @@ mux.Handle("POST /api/posts/{id}/comments", geesehttp.Require(flock, "comments",
 server := &http.Server{Handler: geesehttp.Guard(flock, mux)}
 ```
 
-`Guard` admits every request, a WebSocket upgrade or a request for server-sent events as a stream. Refusals are `503` with `Retry-After`; a feature that isn't on is `{"code": "feature_unavailable", ...}`.
+`Guard` admits every request, WebSocket upgrades and streams of server-sent events included. Refusals are `503` with `Retry-After`; a feature that isn't on is `{"code": "feature_unavailable", ...}`.
 
 ## gRPC
 
 Interceptors, a health service, and the same errors as `UNAVAILABLE`, which gRPC clients may retry. These are a few lines to keep in the application, so geese doesn't pull gRPC into everyone's module:
 
 ```go
-// admit admits every unary call as work a migration waits for.
+// admit admits every unary call.
 func admit(flock *geese.Flock) grpc.UnaryServerInterceptor {
 	return func(ctx context.Context, req any, _ *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
 		ctx, release, err := flock.Admit(ctx)
@@ -45,11 +44,10 @@ func admit(flock *geese.Flock) grpc.UnaryServerInterceptor {
 	}
 }
 
-// admitStream admits every streaming call as a stream, which a migration
-// interrupts; its client calls again.
+// admitStream admits every streaming call.
 func admitStream(flock *geese.Flock) grpc.StreamServerInterceptor {
 	return func(srv any, ss grpc.ServerStream, _ *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
-		ctx, release, err := flock.AdmitStream(ss.Context())
+		ctx, release, err := flock.Admit(ss.Context())
 		if err != nil {
 			return unavailable(err)
 		}
@@ -65,15 +63,13 @@ type admitted struct {
 
 func (s admitted) Context() context.Context { return s.ctx }
 
-// unavailable is UNAVAILABLE, with why: grounded, migrating, or a feature
-// that isn't on yet.
+// unavailable is UNAVAILABLE, with why: grounded, or a feature that isn't on
+// yet.
 func unavailable(err error) error {
 	reason := "UNAVAILABLE"
 	switch {
 	case errors.Is(err, geese.ErrInactive):
 		reason = "FEATURE_UNAVAILABLE"
-	case errors.Is(err, geese.ErrMigrating):
-		reason = "MIGRATING"
 	case errors.Is(err, geese.ErrGrounded):
 		reason = "GROUNDED"
 	}
@@ -154,7 +150,7 @@ A queue consumer, a scheduled job or a socket server admits each unit of work th
 ```go
 ctx, release, err := flock.Admit(ctx)
 if err != nil {
-	return err // nack: redelivered once the flock has landed on the new schema
+	return err // nack: redelivered to a goose that has its place
 }
 defer release()
 ```

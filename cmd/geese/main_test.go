@@ -40,8 +40,8 @@ const plan = `{"maxActiveVersions":4,"minimumSupportedVersion":1,"latestMigratio
 // beside it.
 func TestCheckBesideThePlan(t *testing.T) {
 	root := repo(t, "flightplan.json", plan, map[string]string{
-		"migrations/00001_baseline.sql": "",
-		"migrations/00002_lists.sql":    "",
+		"migrations/00001_baseline.sql": "-- +goose Up\nCREATE TABLE lists (id bigint);",
+		"migrations/00002_lists.sql":    "-- +goose Up\nALTER TABLE lists ADD COLUMN name text;",
 		"compat_v0001.go":               "package main\n\nconst _ = support.ServeV1\n",
 	})
 	if err := run([]string{"check"}); err != nil {
@@ -64,8 +64,8 @@ func TestCheckBesideThePlan(t *testing.T) {
 // A plan elsewhere has its migrations and tokens beside it.
 func TestCheckAndTokens(t *testing.T) {
 	root := repo(t, "server/db/flightplan.json", plan, map[string]string{
-		"server/db/migrations/00001_baseline.sql": "",
-		"server/db/migrations/00002_lists.sql":    "",
+		"server/db/migrations/00001_baseline.sql": "-- +goose Up\nCREATE TABLE lists (id bigint);",
+		"server/db/migrations/00002_lists.sql":    "-- +goose Up\nALTER TABLE lists ADD COLUMN name text;",
 		"server/app/compat_v0001.go":              "package app\n\nconst _ = support.ServeV1\n",
 	})
 	t.Chdir(root)

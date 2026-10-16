@@ -111,23 +111,29 @@ func TestMigratingTwiceAtOnceAppliesOnce(t *testing.T) {
 	}
 }
 
-// The flock goes on after a migration fails, so it refuses one that would run
-// outside a transaction, before running anything.
-func TestTheFlockMigratesOnlyInATransaction(t *testing.T) {
+// The flock refuses a migration that would disrupt it, before running
+// anything; outside a transaction, it builds an index concurrently, and
+// nothing else.
+func TestTheFlockRunsOnlyWhatDoesntDisruptIt(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 	conn, _ := geesetest.Start(t, ctx)
-	unsafe := Migrations{FS: fstest.MapFS{
-		"migrations/00001_lists.sql": {Data: []byte("-- +goose Up\nCREATE TABLE lists (id bigint PRIMARY KEY);\n")},
-		"migrations/00002_index.sql": {Data: []byte("-- +goose NO TRANSACTION\n-- +goose Up\nCREATE INDEX CONCURRENTLY lists_id ON lists (id);\n")},
+	migrations := Migrations{FS: fstest.MapFS{
+		"migrations/00001_lists.sql":  {Data: []byte("-- +goose Up\nCREATE TABLE lists (id bigint PRIMARY KEY, name text);\n")},
+		"migrations/00002_index.sql":  {Data: []byte("-- +goose NO TRANSACTION\n-- +goose Up\nDROP INDEX CONCURRENTLY IF EXISTS lists_name;\nCREATE INDEX CONCURRENTLY lists_name ON lists (name);\n")},
+		"migrations/00003_rename.sql": {Data: []byte("-- +goose Up\nALTER TABLE lists RENAME name TO title;\n")},
 	}, Dir: "migrations"}
-	if err := unsafe.MigrateTo(ctx, conn, 1); err != nil {
-		t.Fatalf("a transactional migration: %v", err)
+	if err := migrations.MigrateTo(ctx, conn, 2); err != nil {
+		t.Fatalf("an index built concurrently: %v", err)
 	}
-	if err := unsafe.MigrateTo(ctx, conn, 2); err == nil || !strings.Contains(err.Error(), "00002_index.sql runs outside a transaction") {
-		t.Fatalf("ran a migration outside a transaction: %v", err)
+	if err := migrations.MigrateTo(ctx, conn, 3); err == nil || !strings.Contains(err.Error(), "migration 3 would disrupt the flock") {
+		t.Fatalf("ran a rename: %v", err)
 	}
-	if version, err := unsafe.version(ctx, conn); err != nil || version != 1 {
+	if version, err := migrations.version(ctx, conn); err != nil || version != 2 {
 		t.Fatalf("the schema moved to %d: %v", version, err)
+	}
+	var valid bool
+	if err := conn.QueryRowContext(ctx, `SELECT indisvalid FROM pg_index WHERE indexrelid='lists_name'::regclass`).Scan(&valid); err != nil || !valid {
+		t.Fatalf("the index isn't built: %v", err)
 	}
 }

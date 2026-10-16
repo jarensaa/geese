@@ -8,7 +8,6 @@ import (
 	"log/slog"
 	"math/rand/v2"
 	"slices"
-	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
@@ -76,14 +75,13 @@ func (f *Flock) unanimous(ctx context.Context, tx *sql.Tx) error {
 	return nil
 }
 
-// TryMigrate migrates the schema at most one version, when this goose leads,
-// the weather is calm, and every goose heard serves the next version. It sets
-// the flock's heading first, which each goose hears on its next honk. When
-// code already serving might not keep working through the migration
-// (pauses), every goose gathers for it, and the leader migrates once all of
-// them have; otherwise it migrates while the flock serves. A
-// flock that doesn't gather in time, or a migration that fails, goes on at the
-// schema applied, and the next attempt waits (retryAfter).
+// TryMigrate migrates the schema at most one version, while the flock serves:
+// when this goose leads, the weather is calm, every goose heard serves the
+// next version and declares unused what it drops, and the migrator says it
+// keeps the code already serving working. The heading it sets first fences
+// out a goose that joins meanwhile and couldn't serve the migration. A
+// migration that fails changes nothing, and the next attempt waits
+// (retryAfter).
 func (f *Flock) TryMigrate(ctx context.Context) error {
 	if f.Version() >= f.window.Latest && !f.headingSet.Load() {
 		return nil
@@ -123,7 +121,7 @@ func (f *Flock) TryMigrate(ctx context.Context) error {
 		return fmt.Errorf("geese: the flock is heading for %d, and the schema is at %d", heading.Int64, current)
 	}
 	// The last attempt at this version failed: the next one waits its turn.
-	if !heading.Valid && failedFor.Valid && failedFor.Int64 == target && waiting {
+	if failedFor.Valid && failedFor.Int64 == target && waiting {
 		return nil
 	}
 	var unable int
@@ -133,47 +131,56 @@ func (f *Flock) TryMigrate(ctx context.Context) error {
 	if unable > 0 {
 		return nil
 	}
-	why, err := f.pauses(ctx, tx, target)
+	change, err := f.migrator.Change(target)
+	if err == nil && change.Disrupts != "" {
+		err = fmt.Errorf("geese: migration %d would disrupt the flock, which serves throughout: %s", target, change.Disrupts)
+	}
 	if err != nil {
+		return f.fail(ctx, tx, current, target, err)
+	}
+	// A goose that may still use what the migration drops holds it back, until it lands.
+	var undeclared int
+	if err = tx.QueryRowContext(ctx, `SELECT count(*) FROM geese_flock WHERE heard_until > clock_timestamp() AND NOT (unused @> $1::text[])`,
+		append([]string{}, change.Drops...)).Scan(&undeclared); err != nil {
 		return err
 	}
-	if _, err = tx.ExecContext(ctx, `UPDATE geese_flight SET heading_for=$1,departed_at=clock_timestamp(),pausing=$2 WHERE id=true`, target, why != ""); err != nil {
+	if undeclared > 0 {
+		return nil
+	}
+	if _, err = tx.ExecContext(ctx, `UPDATE geese_flight SET heading_for=$1,dropping=$2::text[] WHERE id=true`, target, append([]string{}, change.Drops...)); err != nil {
 		return err
 	}
 	if err = tx.Commit(); err != nil {
 		return err
 	}
-	if why != "" {
-		slog.Info("geese: migrating with a pause", "target", target, "why", why)
-		if err = f.awaitGathered(ctx, target); err == nil {
-			err = f.migrator.MigrateTo(ctx, f.db, target)
-		}
-	} else {
-		slog.Info("geese: migrating without a pause", "target", target)
-		err = f.migrateWithoutAPause(ctx, target)
-	}
-	if err == nil {
+	slog.Info("geese: migrating", "target", target)
+	if err = f.migrate(ctx, target, change); err == nil {
 		return f.finishMigration(ctx, target)
 	}
-	err = fmt.Errorf("geese: migrate to %d: %w", target, err)
-	// The flock goes on, even when the leader's step was cancelled.
-	goOnCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), ownDeadline)
+	// What failed is recorded, even when the leader's step was cancelled.
+	failCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), ownDeadline)
 	defer cancel()
-	retry, goOnErr := f.goOn(goOnCtx, target, err)
-	if goOnErr != nil {
-		return errors.Join(err, goOnErr)
+	failTx, version, txErr := f.coordinated(failCtx)
+	if txErr != nil {
+		return errors.Join(err, txErr)
 	}
-	if retry > 0 {
-		return fmt.Errorf("%w (the flock goes on at %d, and tries again in %s)", err, current, retry)
+	defer failTx.Rollback()
+	if version >= target {
+		return nil
 	}
-	return err
+	return f.fail(failCtx, failTx, current, target, fmt.Errorf("geese: migrate to %d: %w", target, err))
 }
 
-// migrateWithoutAPause migrates while the flock serves, never holding up its
-// queries: each lock is waited for lockTimeout at most, so nothing queues long
-// behind one the migration hasn't got. A migration that didn't get a lock,
-// being transactional, changed nothing, and tries again.
-func (f *Flock) migrateWithoutAPause(ctx context.Context, target int64) error {
+// migrate runs the migration to target while the flock serves, never holding
+// up its queries: each lock is waited for lockTimeout at most, so nothing
+// queues long behind one the migration hasn't got. A migration that didn't
+// get a lock, being transactional, changed nothing, and tries again. One that
+// builds an index concurrently holds up no one while it waits, and isn't held
+// to the timeout.
+func (f *Flock) migrate(ctx context.Context, target int64, change Change) error {
+	if change.Concurrently {
+		return f.migrator.MigrateTo(ctx, f.db, target)
+	}
 	config := f.dbConfig.Copy()
 	config.RuntimeParams["lock_timeout"] = fmt.Sprintf("%dms", lockTimeout.Milliseconds())
 	db := stdlib.OpenDB(*config)
@@ -198,86 +205,30 @@ func lockNotAvailable(err error) bool {
 	return errors.As(err, &pgErr) && pgErr.Code == "55P03"
 }
 
-// pauses says why the flock pauses for the migration to target, or nothing
-// when code already serving keeps working through it: the migrator says what
-// it changes, and every goose heard declares unused what it drops. A migration
-// that needs no pause never gets one, however often it's tried.
-func (f *Flock) pauses(ctx context.Context, tx *sql.Tx, target int64) (string, error) {
-	classifier, ok := f.migrator.(Classifier)
-	if !ok {
-		return "the migrator doesn't say what its migrations change", nil
-	}
-	change, err := classifier.Change(target)
-	if err != nil {
-		return "", err
-	}
-	if change.Pause != "" || len(change.Drops) == 0 {
-		return change.Pause, nil
-	}
-	var undeclared int
-	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM geese_flock WHERE heard_until > clock_timestamp() AND NOT (unused @> $1::text[])`,
-		change.Drops).Scan(&undeclared); err != nil {
-		return "", err
-	}
-	if undeclared > 0 {
-		return fmt.Sprintf("%d geese heard don't declare %s unused", undeclared, strings.Join(change.Drops, ", ")), nil
-	}
-	return "", nil
-}
-
-// awaitGathered waits until every goose heard has gathered for target.
-func (f *Flock) awaitGathered(ctx context.Context, target int64) error {
-	deadline := time.Now().Add(gatherTimeout)
-	for {
-		var straggling int
-		if err := f.db.QueryRowContext(ctx, `SELECT count(*) FROM geese_flock WHERE heard_until > clock_timestamp()
-			AND gathered_for IS DISTINCT FROM $1`, target).Scan(&straggling); err != nil {
-			return err
-		}
-		if straggling == 0 {
-			return nil
-		}
-		if time.Now().After(deadline) {
-			return fmt.Errorf("geese: %d geese didn't gather for schema %d", straggling, target)
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(100 * time.Millisecond):
-		}
-	}
-}
-
-// goOn lets the flock go on at the schema applied when an attempt to migrate
-// to target didn't, unless it was applied meanwhile, and records why: the next
-// attempt waits the returned time.
-func (f *Flock) goOn(ctx context.Context, target int64, why error) (time.Duration, error) {
-	tx, version, err := f.coordinated(ctx)
-	if err != nil {
-		return 0, err
-	}
-	defer tx.Rollback()
-	if version >= target {
-		return 0, nil
-	}
+// fail records, in tx, an attempt to migrate to target that didn't, clearing
+// any heading, so the next attempt waits its turn, and says when that is.
+func (f *Flock) fail(ctx context.Context, tx *sql.Tx, current, target int64, why error) error {
 	var failedFor sql.NullInt64
 	var failures int
-	if err = tx.QueryRowContext(ctx, `SELECT failed_for,failures FROM geese_flight WHERE id=true FOR UPDATE`).Scan(&failedFor, &failures); err != nil {
-		return 0, err
+	if err := tx.QueryRowContext(ctx, `SELECT failed_for,failures FROM geese_flight WHERE id=true FOR UPDATE`).Scan(&failedFor, &failures); err != nil {
+		return errors.Join(why, err)
 	}
 	if !failedFor.Valid || failedFor.Int64 != target {
 		failures = 0
 	}
 	failures++
 	retry := retryIn(failures)
-	if _, err = tx.ExecContext(ctx, `UPDATE geese_flight SET heading_for=NULL,departed_at=NULL,failed_for=$1,failures=$2,
+	if _, err := tx.ExecContext(ctx, `UPDATE geese_flight SET heading_for=NULL,dropping='{}',failed_for=$1,failures=$2,
 		retry_at=clock_timestamp()+$3::interval,failure=$4 WHERE id=true`, target, failures, retry.String(), why.Error()); err != nil {
-		return 0, err
+		return errors.Join(why, err)
 	}
-	return retry, tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return errors.Join(why, err)
+	}
+	return fmt.Errorf("%w (the flock goes on at %d, and tries again in %s)", why, current, retry)
 }
 
-// finishMigration says the flock has arrived: held work resumes on each goose's next honk.
+// finishMigration says the flock has arrived.
 func (f *Flock) finishMigration(ctx context.Context, target int64) error {
 	tx, version, err := f.coordinated(ctx)
 	if err != nil {
@@ -287,7 +238,7 @@ func (f *Flock) finishMigration(ctx context.Context, target int64) error {
 	if version != target {
 		return fmt.Errorf("geese: the schema is at %d, expected %d", version, target)
 	}
-	if _, err = tx.ExecContext(ctx, `UPDATE geese_flight SET heading_for=NULL,departed_at=NULL,failed_for=NULL,failures=0,retry_at=NULL,failure=NULL
+	if _, err = tx.ExecContext(ctx, `UPDATE geese_flight SET heading_for=NULL,dropping='{}',failed_for=NULL,failures=0,retry_at=NULL,failure=NULL
 		WHERE id=true AND heading_for=$1`, target); err != nil {
 		return err
 	}

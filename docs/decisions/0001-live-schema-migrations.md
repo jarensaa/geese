@@ -2,7 +2,7 @@
 
 > **In geese's words.** This decision was made while the coordinator lived inside an application, and is kept as it was argued. Its pods are geese; a pod's lease is a goose's place in the flock, kept by honking (`geese_flock`, ex `schema_instances`); the upgrade fence is the flock's heading (`geese_flight`, ex `schema_upgrade_state`); draining is gathering; the deployment gate is the weather; the migration policy is the flight plan. Other ADR numbers are the application's own decisions.
 
-Status: Accepted. What a failed migration does is amended by [decision 0004](0004-a-failed-migration.md), and which migrations drain by [decision 0005](0005-pausing-only-when-it-must.md).
+Status: Accepted. What a failed migration does is amended by [decision 0004](0004-a-failed-migration.md), which migrations drain by [decision 0005](0005-pausing-only-when-it-must.md), and draining is removed by [decision 0006](0006-never-pausing.md): the flock runs only migrations the code serving can't notice.
 
 ## Context
 

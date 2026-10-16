@@ -9,27 +9,31 @@ import (
 )
 
 // Classify says what a SQL migration does to code already serving the schema
-// before it. It reads the statements of its Up section, and lets the flock go
-// on serving through those it knows keep that code working and hold their
-// locks only briefly: making tables, and indexes on them; adding types,
-// sequences, schemas, enum values and comments; adding a column that's
-// nullable or has a constant default; adding a constraint NOT VALID, and
-// validating it in a migration of its own; and dropping tables and columns,
-// which every goose must declare unused. Anything else, and anything it can't read for certain,
-// pauses.
+// before it. It reads the statements of its Up section, and lets the flock run
+// only those it knows keep that code working and hold their locks briefly:
+// making tables, and indexes on them; adding types, sequences, schemas, enum
+// values and comments; adding a column that's nullable or has a constant
+// default; adding a constraint NOT VALID, and validating it in a migration of
+// its own; dropping tables and columns, which every goose must declare
+// unused; and, outside a transaction, building an index concurrently, alone,
+// after dropping what a failed build of it left. Anything else, and anything
+// it can't read for certain, it says disrupts.
 func Classify(migration []byte) geese.Change {
-	up, why := upSection(string(migration))
+	up, outside, why := upSection(string(migration))
 	if why != "" {
-		return geese.Change{Pause: why}
+		return geese.Change{Disrupts: why}
 	}
 	statements, why := statementsOf(up)
 	if why != "" {
-		return geese.Change{Pause: why}
+		return geese.Change{Disrupts: why}
+	}
+	if outside {
+		return concurrentIndex(statements)
 	}
 	if len(statements) > 1 {
 		for _, statement := range statements {
 			if match := alterTable.FindStringSubmatch(statement); match != nil && validate.MatchString(match[2]) {
-				return geese.Change{Pause: "VALIDATE CONSTRAINT scans the table while holding the locks the migration's other statements took: give it a migration of its own"}
+				return geese.Change{Disrupts: "VALIDATE CONSTRAINT scans the table while holding the locks the migration's other statements took: give it a migration of its own"}
 			}
 		}
 	}
@@ -38,7 +42,7 @@ func Classify(migration []byte) geese.Change {
 	for _, statement := range statements {
 		dropped, why := classify(statement, created)
 		if why != "" {
-			return geese.Change{Pause: why}
+			return geese.Change{Disrupts: why}
 		}
 		drops = append(drops, dropped...)
 	}
@@ -47,9 +51,10 @@ func Classify(migration []byte) geese.Change {
 
 var annotation = regexp.MustCompile(`^\s*--\s*\+goose\s+(.+?)\s*$`)
 
-// upSection is the SQL of a migration's Up section, or why it can't be read.
-func upSection(migration string) (string, string) {
-	var up strings.Builder
+// upSection is the SQL of a migration's Up section, and whether goose runs
+// it outside a transaction, or why it can't be read.
+func upSection(migration string) (up string, outside bool, why string) {
+	var b strings.Builder
 	in, seen := false, false
 	for _, line := range strings.Split(migration, "\n") {
 		if match := annotation.FindStringSubmatch(line); match != nil {
@@ -59,23 +64,48 @@ func upSection(migration string) (string, string) {
 			case "DOWN":
 				in = false
 			case "NO TRANSACTION":
-				return "", "it runs outside a transaction"
+				outside = true
 			default:
 				if in {
-					return "", fmt.Sprintf("it has goose's %s, which geese doesn't read", match[1])
+					return "", false, fmt.Sprintf("it has goose's %s, which geese doesn't read", match[1])
 				}
 			}
 			continue
 		}
 		if in {
-			up.WriteString(line)
-			up.WriteByte('\n')
+			b.WriteString(line)
+			b.WriteByte('\n')
 		}
 	}
 	if !seen {
-		return "", "it has no -- +goose Up section"
+		return "", false, "it has no -- +goose Up section"
 	}
-	return up.String(), ""
+	return b.String(), outside, ""
+}
+
+var (
+	dropIndexConcurrently   = regexp.MustCompile(`(?i)^drop index concurrently if exists (` + name + `)$`)
+	createIndexConcurrently = regexp.MustCompile(`(?i)^create (?:unique )?index concurrently (` + ident + `) on (?:only )?` + name + `\b`)
+)
+
+// concurrentIndex is what a migration outside a transaction changes. Only
+// building an index concurrently holds up no one; and as one that fails
+// leaves an invalid index behind, the migration drops it first, so trying
+// again starts afresh.
+func concurrentIndex(statements []string) geese.Change {
+	refused := geese.Change{Disrupts: "it runs outside a transaction, so one that fails leaves the schema part changed: outside one, the flock only builds an index, as DROP INDEX CONCURRENTLY IF EXISTS i; CREATE INDEX CONCURRENTLY i ON t (…), alone"}
+	if len(statements) != 2 {
+		return refused
+	}
+	dropped, created := dropIndexConcurrently.FindStringSubmatch(statements[0]), createIndexConcurrently.FindStringSubmatch(statements[1])
+	if dropped == nil || created == nil {
+		return refused
+	}
+	parts := strings.Split(normalize(dropped[1]), ".")
+	if parts[len(parts)-1] != normalize(created[1]) {
+		return refused
+	}
+	return geese.Change{Concurrently: true}
 }
 
 var dollarQuote = regexp.MustCompile(`^\$[A-Za-z_]*\$`)
@@ -175,7 +205,7 @@ var (
 	identifierOrComma = regexp.MustCompile(`"[^"]+"|[^,."\s]+|[.,]`)
 )
 
-// classify says what one statement drops, or why the flock pauses for it.
+// classify says what one statement drops, or why it disrupts the flock.
 // Tables made earlier in the migration are in created: nothing serving reads
 // them yet.
 func classify(statement string, created map[string]bool) ([]string, string) {
@@ -187,7 +217,7 @@ func classify(statement string, created map[string]bool) ([]string, string) {
 		if created[normalize(match[1])] {
 			return nil, ""
 		}
-		return nil, fmt.Sprintf("CREATE INDEX on %s blocks writes to it while it builds", normalize(match[1]))
+		return nil, fmt.Sprintf("CREATE INDEX on %s blocks writes to it while it builds: build it CONCURRENTLY, in a migration of its own", normalize(match[1]))
 	}
 	if match := alterTable.FindStringSubmatch(statement); match != nil {
 		table, action := normalize(match[1]), match[2]
@@ -239,7 +269,7 @@ func classify(statement string, created map[string]bool) ([]string, string) {
 	if len(statement) > 60 {
 		statement = statement[:60] + "…"
 	}
-	return nil, fmt.Sprintf("geese can't tell code already serving keeps working through %q", statement)
+	return nil, fmt.Sprintf("geese can't tell code already serving keeps working through %q: make it in steps that do", statement)
 }
 
 // normalize is a name as PostgreSQL resolves it: quoted parts as they are,

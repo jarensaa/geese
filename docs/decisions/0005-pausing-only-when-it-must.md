@@ -1,6 +1,6 @@
 # Decision 0005: The flock pauses only when a migration could break the code running
 
-Status: Accepted. Amends [decision 0001](0001-live-schema-migrations.md), whose flock drained for every upgrade.
+Status: Accepted, and superseded in part by [decision 0006](0006-never-pausing.md): the flock no longer pauses at all. What it runs, the declarations of what's unused, and the lock waits stand. Amends [decision 0001](0001-live-schema-migrations.md), whose flock drained for every upgrade.
 
 ## Context
 

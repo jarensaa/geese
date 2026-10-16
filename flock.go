@@ -54,35 +54,35 @@ type Capability struct {
 
 // Migrator is the application's migrations: geese decides when to run them,
 // and the migrator runs them. Version reads the schema version applied, in
-// the transaction given; MigrateTo migrates to exactly the target. A MigrateTo
-// that fails must leave the schema as it was, as a transactional migration
-// does: the flock goes on at the version applied. Two calls of MigrateTo may
-// overlap, as when a leader's lock went with its connection while
-// it migrated and another took over: they must apply each migration once, as a
-// lock held while migrating does. Package goose is a Migrator for
+// the transaction given; Change says what the migration to target does to
+// code already serving; MigrateTo migrates to exactly the target.
+//
+// A MigrateTo that fails must leave the schema as it was, as a transactional
+// migration does: the flock goes on at the version applied. Two calls of
+// MigrateTo may overlap, as when a leader's lock went with its connection
+// while it migrated and another took over: they must apply each migration
+// once, as a lock held while migrating does. Package goose is a Migrator for
 // pressly/goose.
 type Migrator interface {
 	Version(ctx context.Context, tx *sql.Tx) (int64, error)
+	Change(target int64) (Change, error)
 	MigrateTo(ctx context.Context, db *sql.DB, target int64) error
 }
 
 // Change is what a migration does to code already serving the schema before
-// it: whether the flock must pause for it, and what it drops.
+// it. The flock serves throughout every migration it runs, so it runs only
+// those that keep that code working.
 type Change struct {
-	// Pause says why the flock pauses for the migration: why code already
-	// serving might not keep working while it applies. Empty, it applies while
-	// the flock serves, as adding a table or a nullable column does.
-	Pause string
+	// Disrupts says why the migration could break code already serving, or
+	// hold it up: the flock won't run it. Empty, the migration keeps that code
+	// working, as adding a table or a nullable column does.
+	Disrupts string
 	// Drops are the tables ("invites") and columns ("lists.archived") it
-	// drops. Without a pause, every goose heard must declare each unused.
+	// drops: it runs once every goose heard declares each unused.
 	Drops []string
-}
-
-// Classifier is a Migrator that says what each migration changes, so the
-// flock pauses only for those that need it. The flock pauses for every
-// migration of a Migrator that isn't one. Package goose's is.
-type Classifier interface {
-	Change(target int64) (Change, error)
+	// Concurrently says it builds an index without blocking writes, waiting
+	// for the transactions before it to end: it isn't held to a lock timeout.
+	Concurrently bool
 }
 
 // Config is what a process brings to the flock.
@@ -106,8 +106,7 @@ type Config struct {
 	Retired []string
 	// Unused are the tables ("invites") and columns ("lists.archived") this
 	// image's code never touches, as its flight plan declares. A migration
-	// that drops them applies without a pause once every goose heard declares
-	// them unused.
+	// that drops them runs once every goose heard declares them unused.
 	Unused []string
 }
 
@@ -116,9 +115,6 @@ var (
 	// flock: its lease lapsed, or it can't serve the schema or capabilities
 	// the flock has. It serves again once a honk is heard.
 	ErrGrounded = errors.New("geese: grounded, without a place in the flock")
-	// ErrMigrating is the answer to work held longer than a minute while
-	// the flock migrates.
-	ErrMigrating = errors.New("geese: the flock is migrating")
 	// ErrInactive is the answer to a feature whose capability isn't on yet
 	// (Require). A client reads it as "not yet", whatever the transport.
 	ErrInactive = errors.New("geese: the capability isn't on yet")
@@ -127,42 +123,26 @@ var (
 // How the flock keeps together. A goose honks every renewInterval, and is
 // heard for leaseFor: one that isn't heard again has left the flock. Its own
 // deadline is shorter than the flock's, so it stops its work before the others
-// count it gone. While the flock gathers for a migration, it honks every
-// gatheringInterval, so held work waits as little as possible.
+// count it gone.
 const (
-	renewInterval     = 2 * time.Second
-	gatheringInterval = 250 * time.Millisecond
-	leaseFor          = 10 * time.Second
-	ownDeadline       = 8 * time.Second
+	renewInterval = 2 * time.Second
+	leaseFor      = 10 * time.Second
+	ownDeadline   = 8 * time.Second
 )
 
-// A migration may change what the current schema's code relies on, so no
-// admitted work runs while one applies. Once the leader sets the flock's
-// heading, every goose holds new work, interrupts streams, lets work in flight
-// finish and says it has gathered; the leader migrates only when every goose
-// heard has. Work in flight longer than gatherGrace is cancelled; a leader
-// that waits longer than gatherTimeout lets the flock go on as it was; and
-// work held longer than holdLimit is refused.
-//
-// An attempt that doesn't migrate, because the flock didn't gather or the
-// migration failed, lets the flock go on at the schema applied. The next
-// attempt at that version waits retryAfter, twice as long after each failure
-// in a row, up to retryLimit, so a migration that keeps failing pauses the
-// flock only now and then.
+// How the flock migrates while it serves. A migration waits at most
+// lockTimeout for a lock, so a query arriving meanwhile waits no longer behind
+// it, and well within PostgreSQL's deadlock check, so it's the migration that
+// gives up, never the application's transaction. It tries again after
+// lockRetry or so, lockAttempts times. An attempt that fails changes nothing,
+// and the next attempt at that version waits retryAfter, twice as long after
+// each failure in a row, up to retryLimit.
 const (
-	gatherGrace   = 10 * time.Second
-	gatherTimeout = 30 * time.Second
-	holdLimit     = 60 * time.Second
-	retryAfter    = 30 * time.Second
-	retryLimit    = 10 * time.Minute
-	// A migration without a pause waits at most lockTimeout for a lock, so a
-	// query arriving meanwhile waits no longer behind it, and well within
-	// PostgreSQL's deadlock check, so it's the migration that gives up, never
-	// the application's transaction. It tries again after lockRetry or so,
-	// lockAttempts times, before the attempt fails.
 	lockTimeout  = 50 * time.Millisecond
 	lockRetry    = 250 * time.Millisecond
 	lockAttempts = 20
+	retryAfter   = 30 * time.Second
+	retryLimit   = 10 * time.Minute
 )
 
 // retryIn is how long the next attempt waits after failures in a row.
@@ -176,16 +156,9 @@ func retryIn(failures int) time.Duration {
 	return wait
 }
 
-// admission is one unit of admitted work. A stream, such as a socket, is
-// interrupted by a migration instead of waited for; its client reconnects.
-type admission struct {
-	cancel context.CancelFunc
-	stream bool
-}
-
 // Flock is this process's place in the flock: one per process. Every unit
-// of database work enters through Admit or AdmitStream; a goose that can't
-// keep its place cancels what it admitted.
+// of database work enters through Admit; a goose that can't keep its place
+// cancels what it admitted.
 type Flock struct {
 	db           *sql.DB
 	id           string
@@ -206,15 +179,9 @@ type Flock struct {
 	mu           sync.Mutex
 	leaseTimer   *time.Timer
 	leaseEpoch   uint64
-	requests     map[uint64]admission
+	requests     map[uint64]context.CancelFunc
 	nextRequest  uint64
 	leaderCancel context.CancelFunc
-	// While gathering for a migration: where the flock is heading, when the
-	// gathering began, and a channel closed when it ends, which held work
-	// waits on.
-	gatheringFor  int64
-	gatherStarted time.Time
-	resumed       chan struct{}
 }
 
 // Join takes this process's place in the flock: it checks it can serve the
@@ -258,7 +225,7 @@ func Join(ctx context.Context, config Config) (*Flock, error) {
 	}
 	f := &Flock{db: db, id: uuid.NewString(), name: config.Name, release: ReleaseMajor(config.Release), window: config.Window, weather: config.Weather,
 		migrator: config.Migrator, capabilities: slices.Clone(config.Capabilities), retired: retired, unused: append([]string{}, config.Unused...),
-		dbConfig: parsed, requests: map[uint64]admission{}}
+		dbConfig: parsed, requests: map[uint64]context.CancelFunc{}}
 	if err := f.bootstrap(ctx); err != nil {
 		db.Close()
 		return nil, err
@@ -312,14 +279,12 @@ func (f *Flock) groundLocked() {
 		f.leaseTimer.Stop()
 		f.leaseTimer = nil
 	}
-	for _, work := range f.requests {
-		work.cancel()
+	for _, cancel := range f.requests {
+		cancel()
 	}
 	if f.leaderCancel != nil {
 		f.leaderCancel()
 	}
-	// Held work wakes to find the goose grounded.
-	f.endGatheringLocked()
 }
 
 /* ---------- Capabilities ---------- */
@@ -456,6 +421,21 @@ func (f *Flock) Require(ctx context.Context, name string) error {
 		err = fmt.Errorf("%w: %s", ErrInactive, name)
 	}
 	return err
+}
+
+// checkUnused refuses a migration's drops, as JSON, that this image doesn't
+// declare unused.
+func (f *Flock) checkUnused(dropping string) error {
+	var drops []string
+	if err := json.Unmarshal([]byte(dropping), &drops); err != nil {
+		return err
+	}
+	for _, name := range drops {
+		if !slices.Contains(f.unused, name) {
+			return fmt.Errorf("geese: the flock is dropping %s, which this image doesn't declare unused", name)
+		}
+	}
+	return nil
 }
 
 func (f *Flock) checkServeVersion(version int64) error {

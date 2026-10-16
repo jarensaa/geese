@@ -162,7 +162,7 @@ func checkRepository(planPath string, layout check.Layout, staged bool) error {
 		}
 		sql[path] = string(migration)
 	}
-	problems = append(problems, check.Transactional(sql, plan)...)
+	problems = append(problems, check.Disruptive(sql, plan)...)
 	sourcePaths, err := repo.files(layout.Source)
 	if err != nil {
 		return err
@@ -192,9 +192,6 @@ func checkRepository(planPath string, layout check.Layout, staged bool) error {
 		}
 	}
 	fmt.Printf("Flight plan OK: %d of %d active migrations, serving %d–%d.\n", active, plan.MaxActiveVersions, plan.MinimumServeVersion, plan.MaximumServeVersion)
-	for _, line := range check.Pauses(sql, plan) {
-		fmt.Println("  " + line)
-	}
 	return nil
 }
 

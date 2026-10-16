@@ -29,6 +29,8 @@ func (ledger) Version(ctx context.Context, tx *sql.Tx) (int64, error) {
 	return version, err
 }
 
+func (ledger) Change(int64) (Change, error) { return Change{}, nil }
+
 func (ledger) MigrateTo(ctx context.Context, conn *sql.DB, target int64) error {
 	_, err := conn.ExecContext(ctx, `UPDATE ledger SET version=$1`, target)
 	return err
@@ -126,67 +128,6 @@ func TestOldestPageFollowsTheOldestRelease(t *testing.T) {
 	}
 	if got := oldestPage(t, ctx, eight); got != "8.0.0" {
 		t.Fatalf("the floor went to %q", got)
-	}
-}
-
-// A migration waits for admitted work to finish, and holds new work until the
-// schema it runs on is in place.
-func TestTheFlockGathersBeforeItMigrates(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
-	defer cancel()
-	conn, url := standIn(t, ctx)
-	leader, other := goose(t, ctx, url, "leader"), goose(t, ctx, url, "other")
-	runCtx, stop := context.WithCancel(ctx)
-	defer stop()
-	go other.Fly(runCtx)
-	go leader.Fly(runCtx)
-
-	// A request on the other goose is in flight when the migration begins.
-	work, release, err := other.Admit(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	upgraded := make(chan error, 1)
-	go func() { upgraded <- leader.TryMigrate(ctx) }()
-	// Every goose hears the heading at its next honk.
-	time.Sleep(3 * time.Second)
-	var version int64
-	if err := conn.QueryRowContext(ctx, `SELECT version FROM ledger`).Scan(&version); err != nil {
-		t.Fatal(err)
-	}
-	if version != 1 {
-		t.Fatalf("migrated to %d while a request was in flight", version)
-	}
-	if work.Err() != nil {
-		t.Fatal("the migration cancelled a request within its grace")
-	}
-	// New work is held, not refused, meanwhile.
-	held := make(chan int64, 1)
-	go func() {
-		_, done, err := other.Admit(ctx)
-		if err != nil {
-			held <- -1
-			return
-		}
-		held <- other.Version()
-		done()
-	}()
-	release()
-	select {
-	case err := <-upgraded:
-		if err != nil {
-			t.Fatal(err)
-		}
-	case <-time.After(60 * time.Second):
-		t.Fatal("the migration didn't run once the request finished")
-	}
-	select {
-	case got := <-held:
-		if got != 2 {
-			t.Fatalf("held work resumed on schema %d, want 2", got)
-		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("held work didn't resume after the migration")
 	}
 }
 
@@ -437,7 +378,7 @@ func TestStoppingMidHonkLetsWorkInFlightFinish(t *testing.T) {
 }
 
 // A goose grounded while it honks stays grounded until the next honk: what
-// this one says, such as that it has gathered, may no longer be true.
+// this one says may no longer be true.
 func TestGroundedMidHonkStaysGrounded(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
@@ -470,7 +411,7 @@ func honking(t *testing.T, ctx context.Context, live *Flock) {
 			_ = live.Honk(ctx)
 			select {
 			case <-ctx.Done():
-			case <-time.After(gatheringInterval):
+			case <-time.After(100 * time.Millisecond):
 			}
 		}
 	}()
@@ -578,9 +519,9 @@ func joinClassified(t *testing.T, ctx context.Context, url, name string, change 
 	return live
 }
 
-// A migration that code already serving keeps working through applies while
-// the flock serves: nothing gathers, and work in flight runs on.
-func TestAMigrationWithoutAPause(t *testing.T) {
+// The flock migrates while it serves: work in flight runs on, and new work is
+// admitted throughout.
+func TestTheFlockMigratesWhileItServes(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 	_, url := standIn(t, ctx)
@@ -602,48 +543,65 @@ func TestAMigrationWithoutAPause(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("the migration waited for the flock")
 	}
-	if err := other.Honk(ctx); err != nil || other.Version() != 2 || other.gathering() || work.Err() != nil {
-		t.Fatalf("the flock paused: version %d, gathering %v, work %v, honk %v", other.Version(), other.gathering(), work.Err(), err)
+	if _, more, err := other.Admit(ctx); err != nil {
+		t.Fatalf("work wasn't admitted once the flock migrated: %v", err)
+	} else {
+		more()
+	}
+	if err := other.Honk(ctx); err != nil || other.Version() != 2 || work.Err() != nil {
+		t.Fatalf("version %d, work %v, honk %v", other.Version(), work.Err(), err)
 	}
 }
 
-// A migration that drops a column needs no pause once every goose heard
-// declares the column unused.
+// A migration that drops a column waits until every goose heard declares the
+// column unused, and a goose that doesn't can't join while it runs.
 func TestADropWaitsForEveryGooseToDeclareItUnused(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
-	_, url := standIn(t, ctx)
+	conn, url := standIn(t, ctx)
 	drop := Change{Drops: []string{"lists.archived"}}
 	leader := joinClassified(t, ctx, url, "leader", drop, "lists.archived", "invites")
 	older := joinClassified(t, ctx, url, "older", drop)
 
-	pauses := func() string {
-		t.Helper()
-		tx, _, err := leader.coordinated(ctx)
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer tx.Rollback()
-		why, err := leader.pauses(ctx, tx, 2)
-		if err != nil {
-			t.Fatal(err)
-		}
-		return why
-	}
-	if why := pauses(); !strings.Contains(why, "1 geese heard don't declare lists.archived unused") {
-		t.Fatalf("a goose that may read the column: %q", why)
+	if err := leader.TryMigrate(ctx); err != nil || leader.Version() != 1 {
+		t.Fatalf("dropped what a goose may read: version %d, %v", leader.Version(), err)
 	}
 	older.Land()
-	if why := pauses(); why != "" {
-		t.Fatalf("every goose declares it unused: %q", why)
+
+	// While the drop runs, its heading fences out a goose that may read the column.
+	if _, err := conn.ExecContext(ctx, `UPDATE geese_flight SET heading_for=2, dropping='{lists.archived}'`); err != nil {
+		t.Fatal(err)
+	}
+	if late, err := Join(ctx, Config{DatabaseURL: url, Name: "late", Release: "dev", Weather: ClearSkies{}, Migrator: classified{change: drop},
+		Window: Window{ServeFrom: 1, ServeTo: 2, Latest: 2}}); err == nil {
+		late.Land()
+		t.Fatal("a goose that may read the column joined while it's dropped")
+	}
+	if err := leader.TryMigrate(ctx); err != nil || leader.Version() != 2 {
+		t.Fatalf("every goose declares it unused: version %d, %v", leader.Version(), err)
+	}
+}
+
+// A migration that would disrupt the flock isn't run: the attempt is recorded
+// as failed, and the schema stays as it was.
+func TestAMigrationThatWouldDisruptIsRefused(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	conn, url := standIn(t, ctx)
+	leader := joinClassified(t, ctx, url, "leader", Change{Disrupts: "a rename"})
+	if err := leader.TryMigrate(ctx); err == nil || !strings.Contains(err.Error(), "would disrupt the flock") {
+		t.Fatalf("ran a migration that would disrupt the flock: %v", err)
+	}
+	var version int64
+	var failure string
+	if err := conn.QueryRowContext(ctx, `SELECT (SELECT version FROM ledger), failure FROM geese_flight WHERE failed_for=2 AND retry_at > clock_timestamp()`).Scan(&version, &failure); err != nil || version != 1 || !strings.Contains(failure, "a rename") {
+		t.Fatalf("version %d, failure %q: %v", version, failure, err)
 	}
 }
 
 // altering is the stand-in's migrator, whose migration alters a table of the
-// application's, without a pause.
+// application's.
 type altering struct{ ledger }
-
-func (altering) Change(int64) (Change, error) { return Change{}, nil }
 
 func (m altering) MigrateTo(ctx context.Context, conn *sql.DB, target int64) error {
 	if _, err := conn.ExecContext(ctx, `ALTER TABLE lists ADD COLUMN colour text`); err != nil {
@@ -652,11 +610,10 @@ func (m altering) MigrateTo(ctx context.Context, conn *sql.DB, target int64) err
 	return m.ledger.MigrateTo(ctx, conn, target)
 }
 
-// A migration without a pause never holds up the flock's queries: it waits
-// for a lock only a moment, so nothing queues behind it for long, and tries
-// again. One that never gets its lock fails, and its next attempt still
-// doesn't pause.
-func TestAMigrationWithoutAPauseNeverHoldsUpQueries(t *testing.T) {
+// A migration never holds up the flock's queries: it waits for a lock only a
+// moment, so nothing queues behind it for long, and tries again. One that
+// never gets its lock fails, and is tried again later.
+func TestAMigrationNeverHoldsUpQueries(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 	conn, url := standIn(t, ctx)
@@ -698,18 +655,13 @@ func TestAMigrationWithoutAPauseNeverHoldsUpQueries(t *testing.T) {
 		t.Fatalf("migrated through a lock: %v", err)
 	}
 
-	// The next attempt doesn't pause either, and gets its lock once the read
-	// ends, while it tries.
+	// The next attempt gets its lock once the read ends, while it tries.
 	if _, err := conn.ExecContext(ctx, `UPDATE geese_flight SET retry_at=clock_timestamp()`); err != nil {
 		t.Fatal(err)
 	}
 	time.AfterFunc(time.Second, func() { reading.Rollback() })
 	if err := leader.TryMigrate(ctx); err != nil || leader.Version() != 2 {
 		t.Fatalf("migrated to %d: %v", leader.Version(), err)
-	}
-	var pausing bool
-	if err := conn.QueryRowContext(ctx, `SELECT pausing FROM geese_flight`).Scan(&pausing); err != nil || pausing {
-		t.Fatalf("the attempt after a failure paused: %v", err)
 	}
 	stopQuerying()
 	worst := <-slowest

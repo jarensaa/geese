@@ -1,6 +1,6 @@
-geese runs schema migrations for Go services that run as many processes on one PostgreSQL database, during a rolling deploy, without downtime and without hand-written expand-and-contract migrations.
+geese runs schema migrations for Go services that run as many processes on one PostgreSQL database, while they serve: no downtime, no pause, no disruption, and every step of expand and contract checked.
 
-Migration tools like [goose](https://github.com/pressly/goose) apply migrations; geese decides **when**. Each process says, in the database, which schema versions it can serve. One leads, and the flock migrates only once every process can make the journey, pausing them for a moment only when the migration could break the code they run. It runs inside your application, with no Job, operator or sidecar.
+Migration tools like [goose](https://github.com/pressly/goose) apply migrations; geese decides **when**. Each process says, in the database, which schema versions it can serve. One leads, and the flock runs a migration only once every process can make the journey, and only if it keeps the code they run working. It runs inside your application, with no Job, operator or sidecar.
 
 ```sh
 go get github.com/jarensaa/geese

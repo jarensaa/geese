@@ -24,7 +24,7 @@ import (
 //     and one after it (for a rollback from one that already has).
 //   - Unused: the tables ("invites") and columns ("lists.archived") the
 //     image's code no longer touches (Config.Unused). A migration that drops
-//     them applies without a pause once every goose heard declares them.
+//     them runs once every goose heard declares them.
 type FlightPlan struct {
 	MaxActiveVersions       int      `json:"maxActiveVersions"`
 	MinimumSupportedVersion int64    `json:"minimumSupportedVersion"`

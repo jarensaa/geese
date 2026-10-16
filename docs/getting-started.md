@@ -66,7 +66,7 @@ func main() {
 		Name:        os.Getenv("HOSTNAME"),
 		Release:     "1.0.0", // this build's version
 		Window:      plan.Window(),
-		Unused:      plan.Unused,        // what its code no longer touches, so dropping it needs no pause
+		Unused:      plan.Unused,        // what its code no longer touches, so the flock may drop it
 		Weather:     geese.ClearSkies{}, // under Kubernetes, the Deployment's rollout: kube.InCluster
 		Migrator:    migrations,
 	})
@@ -123,7 +123,7 @@ What `main` does, in order:
 
 1. **Join.** The process says, in the database, which schema versions it serves (the flight plan's window), and what release it is.
 2. **Fly.** Every two seconds it honks: it renews its place in the flock, and hears what the others are doing. When it leads, it migrates.
-3. **Admit.** `geesehttp.Guard` admits every request to the flock, so a migration waits for requests in flight and holds new ones for the few seconds it runs.
+3. **Admit.** `geesehttp.Guard` admits every request to the flock, so a process that loses its place cancels them before the others count it gone.
 4. **Land.** When told to stop, it stops flying, finishes its requests in flight, and leaves the flock, so the others stop waiting for it at once.
 
 ## Run it
@@ -154,7 +154,7 @@ docker exec geese-db psql -U postgres -c "SELECT name, serves_from, serves_to FR
 
 ## Ship a migration
 
-The next release adds a column. Its code works on schema 1 and on schema 2, so old and new processes can serve side by side during the rollout. The old code doesn't name the column, and the default fills it in for the old code's inserts, so the flock doesn't need to pause for it.
+The next release adds a column. Its code works on schema 1 and on schema 2, so old and new processes can serve side by side during the rollout. The old code doesn't name the column, and the default fills it in for the old code's inserts, so the flock can add it while it serves.
 
 `migrations/00002_language.sql`:
 
@@ -183,11 +183,11 @@ kill %2; HOSTNAME=four ADDR=:8081 ./quickstart &
 While a process of the old release is in the flock, nothing migrates: it can't serve schema 2. Once the last one has landed, the leader migrates, while both processes go on serving:
 
 ```
-INFO geese: migrating without a pause target=2
+INFO geese: migrating target=2
 INFO geese: migrated version=2
 ```
 
-A migration that could break the code already running, such as a rename, pauses the flock instead: every process holds new requests and finishes those in flight, the leader migrates, and the held requests run on the new schema's code. `geese check` says which kind each migration is ([which migrations pause](concepts.md#which-migrations-pause)). (The `oldest page served raised` line you saw when the first processes started is the flock telling clients which release they need: see [capabilities](capabilities.md).)
+A change the old code would notice, such as a rename, the flock won't run: `geese check` fails it, and it's made in steps that each keep the running code working ([changing what code relies on](concepts.md#changing-what-code-relies-on)). (The `oldest page served raised` line you saw when the first processes started is the flock telling clients which release they need: see [capabilities](capabilities.md).)
 
 A later release raises `minimumServeVersion` to 2, once rolling back to a release that needs schema 1 is no longer an option, and deletes the code that kept schema 1 working. [`geese check`](concepts.md#the-flight-plan) in CI keeps the window within its limits as migrations accumulate.
 

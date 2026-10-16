@@ -95,11 +95,11 @@ func Migrations(paths []string, plan geese.FlightPlan, layout Layout) []string {
 
 var compatName = regexp.MustCompile(`(?:^|/)compat_v0*(\d+)(?:_[a-z][a-z0-9_]*)?\.go$`)
 
-// Transactional fails each migration the flock would run, after the baseline,
-// that goose would run outside a transaction: the flock migrates only in one,
-// so that a migration that fails leaves the schema as it was, and the flock
-// goes on. The baseline is applied to an empty database, outside the flock.
-func Transactional(migrations map[string]string, plan geese.FlightPlan) []string {
+// Disruptive fails each migration the flock would refuse to run: one that
+// would disrupt it (goose.Classify), and one that drops what the flight plan
+// doesn't declare unused. The baseline is applied to an empty database,
+// outside the flock, so it's none of the flock's business.
+func Disruptive(migrations map[string]string, plan geese.FlightPlan) []string {
 	var problems []string
 	for path, migration := range migrations {
 		_, name := split(path)
@@ -110,50 +110,19 @@ func Transactional(migrations map[string]string, plan geese.FlightPlan) []string
 		if version, err := strconv.ParseInt(match[1], 10, 64); err != nil || version <= plan.MinimumSupportedVersion {
 			continue
 		}
-		if !goose.Transactional([]byte(migration)) {
-			problems = append(problems, fmt.Sprintf("%s: runs outside a transaction (+goose NO TRANSACTION), which the flock won't migrate", path))
+		change := goose.Classify([]byte(migration))
+		if change.Disrupts != "" {
+			problems = append(problems, fmt.Sprintf("%s would disrupt the flock: %s", path, change.Disrupts))
+			continue
+		}
+		for _, dropped := range change.Drops {
+			if !slices.Contains(plan.Unused, dropped) {
+				problems = append(problems, fmt.Sprintf("%s drops %s, which the flight plan doesn't declare unused", path, dropped))
+			}
 		}
 	}
 	slices.Sort(problems)
 	return problems
-}
-
-// Pauses says, of each migration the flock would run (after the baseline),
-// whether the flock will pause for it, and why: for review, not a problem.
-func Pauses(migrations map[string]string, plan geese.FlightPlan) []string {
-	paths := make([]string, 0, len(migrations))
-	for path := range migrations {
-		paths = append(paths, path)
-	}
-	slices.Sort(paths)
-	declared := map[string]bool{}
-	for _, name := range plan.Unused {
-		declared[name] = true
-	}
-	var lines []string
-	for _, path := range paths {
-		_, name := split(path)
-		match := versionedName.FindStringSubmatch(name)
-		if match == nil {
-			continue
-		}
-		if version, err := strconv.ParseInt(match[1], 10, 64); err != nil || version <= plan.MinimumSupportedVersion {
-			continue
-		}
-		change := goose.Classify([]byte(migrations[path]))
-		undeclared := slices.DeleteFunc(slices.Clone(change.Drops), func(name string) bool { return declared[name] })
-		switch {
-		case change.Pause != "":
-			lines = append(lines, fmt.Sprintf("%s pauses the flock: %s", name, change.Pause))
-		case len(undeclared) > 0:
-			lines = append(lines, fmt.Sprintf("%s pauses the flock: the flight plan doesn't declare %s unused", name, strings.Join(undeclared, ", ")))
-		case len(change.Drops) > 0:
-			lines = append(lines, fmt.Sprintf("%s needs no pause, once every image running declares %s unused", name, strings.Join(change.Drops, ", ")))
-		default:
-			lines = append(lines, name+" needs no pause")
-		}
-	}
-	return lines
 }
 
 // Compatibility checks each compatibility file: code kept for an older

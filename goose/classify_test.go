@@ -10,7 +10,7 @@ func TestClassify(t *testing.T) {
 	for _, c := range []struct {
 		name      string
 		migration string
-		pauses    string // part of why it pauses; empty when it doesn't
+		disrupts  string // part of why it disrupts the flock; empty when it doesn't
 		drops     []string
 	}{
 		{"a new table, indexed", `-- +goose Up
@@ -59,14 +59,32 @@ ALTER TABLE items VALIDATE CONSTRAINT items_list;`, "a migration of its own", ni
 		{"a function", "-- +goose Up\n-- +goose StatementBegin\nCREATE FUNCTION f() RETURNS int AS $$ SELECT 1; $$ LANGUAGE sql;\n-- +goose StatementEnd", "StatementBegin", nil},
 		{"dollar quotes", "-- +goose Up\nCOMMENT ON TABLE lists IS $$x$$;", "dollar", nil},
 		{"outside a transaction", "-- +goose NO TRANSACTION\n-- +goose Up\nCREATE TABLE notes (id bigint);", "outside a transaction", nil},
+		{"an index built concurrently, without its leftovers dropped first", "-- +goose NO TRANSACTION\n-- +goose Up\nCREATE INDEX CONCURRENTLY lists_name ON lists (name);", "outside a transaction", nil},
+		{"an index built concurrently, if it isn't there", "-- +goose NO TRANSACTION\n-- +goose Up\nDROP INDEX CONCURRENTLY IF EXISTS lists_name;\nCREATE INDEX CONCURRENTLY IF NOT EXISTS lists_name ON lists (name);", "outside a transaction", nil},
+		{"another index's leftovers dropped", "-- +goose NO TRANSACTION\n-- +goose Up\nDROP INDEX CONCURRENTLY IF EXISTS other;\nCREATE INDEX CONCURRENTLY lists_name ON lists (name);", "outside a transaction", nil},
 		{"no Up", "CREATE TABLE notes (id bigint);", "no -- +goose Up", nil},
 	} {
 		change := Classify([]byte(c.migration))
-		if c.pauses == "" && change.Pause != "" || !strings.Contains(change.Pause, c.pauses) {
-			t.Errorf("%s: pauses %q, expected %q", c.name, change.Pause, c.pauses)
+		if c.disrupts == "" && change.Disrupts != "" || !strings.Contains(change.Disrupts, c.disrupts) {
+			t.Errorf("%s: disrupts %q, expected %q", c.name, change.Disrupts, c.disrupts)
 		}
-		if c.pauses == "" && !slices.Equal(change.Drops, c.drops) {
+		if change.Concurrently {
+			t.Errorf("%s: concurrently", c.name)
+		}
+		if c.disrupts == "" && !slices.Equal(change.Drops, c.drops) {
 			t.Errorf("%s: drops %q, expected %q", c.name, change.Drops, c.drops)
 		}
+	}
+}
+
+func TestClassifyAnIndexBuiltConcurrently(t *testing.T) {
+	change := Classify([]byte(`-- +goose NO TRANSACTION
+-- +goose Up
+DROP INDEX CONCURRENTLY IF EXISTS app.lists_name;
+CREATE UNIQUE INDEX CONCURRENTLY lists_name ON app.lists (name);
+-- +goose Down
+DROP INDEX CONCURRENTLY lists_name;`))
+	if change.Disrupts != "" || !change.Concurrently || len(change.Drops) != 0 {
+		t.Fatalf("%+v", change)
 	}
 }

@@ -43,8 +43,6 @@ func (f *Flock) bootstrap(ctx context.Context) error {
 	if err := f.checkServeVersion(version); err != nil {
 		return err
 	}
-	// gathered_for is the migration a goose has gathered for: nothing it
-	// admitted runs until that migration is applied.
 	if _, err = tx.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS geese_flock (
 		id            uuid        PRIMARY KEY,
 		name          text        NOT NULL,
@@ -54,7 +52,6 @@ func (f *Flock) bootstrap(ctx context.Context) error {
 		capabilities  text[]      NOT NULL DEFAULT '{}',
 		unused        text[]      NOT NULL DEFAULT '{}',
 		release_major bigint,
-		gathered_for  bigint,
 		heard_until   timestamptz NOT NULL,
 		joined_at     timestamptz NOT NULL DEFAULT clock_timestamp()
 	)`); err != nil {
@@ -63,8 +60,7 @@ func (f *Flock) bootstrap(ctx context.Context) error {
 	if _, err = tx.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS geese_flight (
 		id                  boolean     PRIMARY KEY DEFAULT true CHECK (id),
 		heading_for         bigint,
-		departed_at         timestamptz,
-		pausing             boolean     NOT NULL DEFAULT true,
+		dropping            text[]      NOT NULL DEFAULT '{}',
 		active_capabilities text[]      NOT NULL DEFAULT '{}',
 		oldest_page_major   bigint,
 		failed_for          bigint,
@@ -136,8 +132,8 @@ func (f *Flock) coordinated(ctx context.Context) (*sql.Tx, int64, error) {
 
 // Honk keeps this goose's place in the flock: it checks the goose can still
 // serve the schema, where the flock is heading, what it has switched on and
-// the oldest page it serves, gathers when the flock is about to migrate, and
-// says so in its row. A goose that can't is grounded until a honk is heard.
+// the oldest page it serves, and says so in its row. A goose that can't is
+// grounded until a honk is heard.
 // Fly honks on its own; Honk is exported for tests and reconciliation.
 func (f *Flock) Honk(ctx context.Context) error {
 	honked := time.Now()
@@ -149,9 +145,8 @@ func (f *Flock) Honk(ctx context.Context) error {
 	}
 	defer tx.Rollback()
 	var heading, floor sql.NullInt64
-	var encoded string
-	var pausing bool
-	if err = tx.QueryRowContext(ctx, `SELECT heading_for,pausing,to_json(active_capabilities)::text,oldest_page_major FROM geese_flight WHERE id=true`).Scan(&heading, &pausing, &encoded, &floor); err != nil {
+	var encoded, dropping string
+	if err = tx.QueryRowContext(ctx, `SELECT heading_for,to_json(dropping)::text,to_json(active_capabilities)::text,oldest_page_major FROM geese_flight WHERE id=true`).Scan(&heading, &dropping, &encoded, &floor); err != nil {
 		f.ground()
 		return err
 	}
@@ -160,10 +155,13 @@ func (f *Flock) Honk(ctx context.Context) error {
 		f.ground()
 		return err
 	}
-	// A goose that can't serve where the flock is heading stays on the ground,
-	// so it never runs against a schema it doesn't know.
-	if err = f.checkServeVersion(version); err == nil && heading.Valid {
-		err = f.checkServeVersion(heading.Int64)
+	// A goose that can't serve where the flock is heading, or that may still
+	// use what the migration drops, stays on the ground: the leader checked
+	// the geese it heard, and this one joins the flock while it migrates.
+	if err = f.checkServeVersion(version); err == nil && heading.Valid && version < heading.Int64 {
+		if err = f.checkServeVersion(heading.Int64); err == nil {
+			err = f.checkUnused(dropping)
+		}
 	}
 	if err == nil {
 		err = f.checkActiveCapabilities(active, version)
@@ -175,17 +173,10 @@ func (f *Flock) Honk(ctx context.Context) error {
 		f.ground()
 		return err
 	}
-	// A heading ahead of the applied schema is a migration about to run:
-	// gather for it, unless the flock needn't pause for it.
-	migrating := heading.Valid && version < heading.Int64 && pausing
-	var gatheredFor sql.NullInt64
-	if migrating && f.gatherFor(heading.Int64) {
-		gatheredFor = heading
-	}
-	if _, err = tx.ExecContext(ctx, `INSERT INTO geese_flock (id,name,protocol,serves_from,serves_to,capabilities,unused,release_major,gathered_for,heard_until)
-		VALUES ($1,$2,$3,$4,$5,$6::text[],$7::text[],$8,$9,clock_timestamp()+$10::interval)
-		ON CONFLICT (id) DO UPDATE SET capabilities=EXCLUDED.capabilities,gathered_for=EXCLUDED.gathered_for,heard_until=EXCLUDED.heard_until`,
-		f.id, f.name, protocol, f.window.ServeFrom, f.window.ServeTo, f.supportedNames(), f.unused, f.release, gatheredFor, leaseFor.String()); err != nil {
+	if _, err = tx.ExecContext(ctx, `INSERT INTO geese_flock (id,name,protocol,serves_from,serves_to,capabilities,unused,release_major,heard_until)
+		VALUES ($1,$2,$3,$4,$5,$6::text[],$7::text[],$8,clock_timestamp()+$9::interval)
+		ON CONFLICT (id) DO UPDATE SET capabilities=EXCLUDED.capabilities,heard_until=EXCLUDED.heard_until`,
+		f.id, f.name, protocol, f.window.ServeFrom, f.window.ServeTo, f.supportedNames(), f.unused, f.release, leaseFor.String()); err != nil {
 		f.ground()
 		return err
 	}
@@ -193,21 +184,17 @@ func (f *Flock) Honk(ctx context.Context) error {
 		f.ground()
 		return err
 	}
-	// The version is stored before held work resumes, so it runs on the new schema's code.
 	f.version.Store(version)
 	f.headingSet.Store(heading.Valid)
 	if !f.keepUntil(epoch, honked.Add(ownDeadline)) {
 		return errGroundedMidHonk
 	}
-	if !migrating {
-		f.endGathering()
-	}
 	return nil
 }
 
 // errGroundedMidHonk is why a honk didn't put its goose back in the air: the
-// goose was grounded while it honked, so what the honk said, such as that the
-// goose had gathered, may no longer be true. The next honk says it again.
+// goose was grounded while it honked, for a reason the honk didn't see, such
+// as its own deadline passing. The next honk checks again.
 var errGroundedMidHonk = errors.New("geese: grounded while honking")
 
 // epoch is how many times this goose's place has changed: a honk keeps it in
@@ -247,10 +234,10 @@ func (f *Flock) keepUntil(epoch uint64, deadline time.Time) bool {
 }
 
 // Fly honks and leads until ctx ends: it keeps this goose's place in the
-// flock, and, when it leads, migrates the schema one version at a time, switches capabilities on
-// and raises the oldest page served. A migration that fails lets the flock go
-// on at the schema applied, and is tried again later. A goose whose honk
-// fails is grounded, and serves again once a honk is heard.
+// flock, and, when it leads, migrates the schema one version at a time,
+// switches capabilities on and raises the oldest page served. A migration that
+// fails changes nothing, and is tried again later. A goose whose honk fails is
+// grounded, and serves again once a honk is heard.
 //
 // When ctx ends, the goose stops honking and leading, but keeps serving what
 // its last honk allows, a few seconds at most, so a process that's stopping
@@ -260,14 +247,10 @@ func (f *Flock) keepUntil(epoch uint64, deadline time.Time) bool {
 func (f *Flock) Fly(ctx context.Context) {
 	go f.leadWhenCalm(ctx)
 	for {
-		interval := renewInterval
-		if f.headingSet.Load() || f.gathering() {
-			interval = gatheringInterval
-		}
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(interval):
+		case <-time.After(renewInterval):
 		}
 		// A honk under way when ctx ends finishes: a goose cut off mid-honk
 		// would be grounded, cancelling the work its process is finishing.
