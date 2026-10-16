@@ -19,7 +19,7 @@ func TestARollupKeepsTheSchema(t *testing.T) {
 	RollupKeepsSchema(t, Rollup{
 		Main:         os.DirFS("testdata/main"),
 		Branch:       goose.Migrations{FS: os.DirFS("testdata"), Dir: "branch"},
-		Plan:         geese.FlightPlan{MaxActiveVersions: 4, MinimumSupportedVersion: 3, LatestMigrationVersion: 3, MinimumServeVersion: 3, MaximumServeVersion: 3},
+		Plan:         geese.FlightPlan{MaxActiveVersions: 4, MinimumSupportedVersion: 3, LatestMigrationVersion: 3, MinimumServeVersion: 3},
 		Capabilities: []geese.Capability{{Name: "doneItems", MinimumSchema: 3}},
 		Retired:      []string{"lists"},
 	})

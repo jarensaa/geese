@@ -49,12 +49,11 @@ func TestOwnDeadlineGroundsAGooseWhoseHonkIsntHeard(t *testing.T) {
 	}
 }
 
-func TestServesOnlyItsDeclaredSchemas(t *testing.T) {
-	// A release may declare it serves the schema after the one it migrates to.
-	live := &Flock{window: Window{ServeFrom: 5, ServeTo: 7, Latest: 6}}
-	for version, served := range map[int64]bool{4: false, 5: true, 7: true, 8: false} {
-		if err := live.checkServeVersion(version); (err == nil) != served {
-			t.Errorf("schema %d: %v", version, err)
+func TestServesItsWindow(t *testing.T) {
+	live := &Flock{window: Window{ServeFrom: 5, Latest: 6}}
+	for version, served := range map[int64]bool{4: false, 5: true, 6: true} {
+		if serving, err := live.serves(context.Background(), nil, version); (err == nil) != served || served && serving != version {
+			t.Errorf("schema %d: serving %d, %v", version, serving, err)
 		}
 	}
 }

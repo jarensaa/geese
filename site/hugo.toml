@@ -95,3 +95,7 @@ enableRobotsTXT = false
   name = "Downtime when asked for"
   pageRef = "/docs/decisions/0007-downtime-when-asked-for"
   weight = 70
+[[menus.decisions]]
+  name = "Rolling back"
+  pageRef = "/docs/decisions/0008-rolling-back"
+  weight = 80

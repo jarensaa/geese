@@ -10,7 +10,7 @@
 6. **A fresh database.** `goose.Migrate(ctx, url, migrations, plan, false)` once, before the first goose joins: a command of the image, never a step of a rollout. It migrates only an empty database, and leaves a current one alone.
 7. **Capabilities.** An endpoint answering `flock.Capabilities` (over HTTP, `geesehttp.Capabilities(flock)` at `GET /api/capabilities`), and `flock.Require` in front of every feature that waits for one. Clients keep [the contract](capabilities.md).
 8. **CI.** `geese check` (the window, every migration one the flock runs, and every drop declared unused) and `geese tokens --check` on every change; `geese check --staged` in a pre-commit hook; the integration tests on `geesetest`, on a database without what the flight plan declares unused (`geesetest.DropUnused` in the template that migrates it); and, when a pull request deletes, edits or renames a migration main has, `goosetest.RollupKeepsSchema` against main's migrations from the merge base.
-9. **Releases.** The image's version is its SemVer release, set at build time and passed as `Config.Release`, and a release that breaks the API is a major one: that's what tells older pages to reload.
+9. **Releases.** The image's version is its SemVer release, set at build time and passed as `Config.Release`, and a release that breaks the API is a major one: that's what tells older pages to reload. Roll back by deploying an older image: it serves the newer schema across migrations that ran live ([rolling back](concepts.md#rolling-back)).
 
 ## Moving from the coordinator geese came from
 

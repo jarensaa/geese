@@ -69,7 +69,7 @@ Each step is a migration geese runs, or code geese's capabilities and declaratio
 Whether code still uses a column is a fact about the images running, not about the schema, so each image says it. The release that stops using `lists.archived` declares it in its flight plan:
 
 ```json
-{"maxActiveVersions": 4, "minimumSupportedVersion": 1, "latestMigrationVersion": 2, "minimumServeVersion": 1, "maximumServeVersion": 2, "unused": ["lists.archived"]}
+{"maxActiveVersions": 4, "minimumSupportedVersion": 1, "latestMigrationVersion": 2, "minimumServeVersion": 1, "unused": ["lists.archived"]}
 ```
 
 and passes it on as `Config.Unused`, so each of its geese says so with every honk. A later release drops the column, and keeps declaring it. The leader drops it once every goose it hears declares it unused; while a goose of an older image that doesn't is still flying, the drop waits. An image that forgets holds the drop back; it never breaks.
@@ -89,7 +89,7 @@ ALTER TABLE lists RENAME name TO title;
 ALTER TABLE lists RENAME title TO name;
 ```
 
-The first line is geese's; the rest is a goose migration as usual, whose `-- +goose Up` and `-- +goose Down` mark the statements that apply it and roll it back.
+The first line is geese's; the rest is a goose migration as usual, whose `-- +goose Up` and `-- +goose Down` mark the statements that apply it and roll it back. geese never runs a Down: a rollback is [another matter](#rolling-back).
 
 The flock then **roosts** for it, instead of serving through it:
 
@@ -98,12 +98,22 @@ The flock then **roosts** for it, instead of serving through it:
 3. Once every goose heard has roosted, the leader runs the migration, which may change anything: nothing runs the code before it, and every goose serves the version after it.
 4. The leader clears the heading, and every goose serves again on its next honk.
 
-While a heading is set, geese honk every quarter second, so the downtime is what the work in flight needs to finish, the migration's own time, and about a second more. If a goose doesn't roost within thirty seconds, the leader gives up, the flock serves again, and the attempt is tried later like any that failed. A migration with downtime runs in a transaction, as every other does, so one that fails leaves the schema as it was. `geese check` lists every migration that takes the flock down, so it's seen in review:
+While a heading is set, geese honk every quarter second, so the downtime is what the work in flight needs to finish, the migration's own time, and about a second more. If a goose doesn't roost within thirty seconds, the leader gives up, the flock serves again, and the attempt is tried later like any that failed. A migration with downtime runs in a transaction, as every other does, so one that fails leaves the schema as it was. It closes the way back: a release from before it [can't be rolled back to](#rolling-back). `geese check` lists every migration that takes the flock down, so it's seen in review:
 
 ```
 Flight plan OK: 3 of 4 active migrations, serving 2–3.
-  migrations/00003_rename.sql takes the flock down while it runs
+  migrations/00003_rename.sql takes the flock down while it runs, and the releases before it can't be rolled back to
 ```
+
+## Rolling back
+
+A database doesn't go backwards: geese never runs a migration's Down. A rollback runs an older image on the newer schema, and that works across every migration the flock ran live, as each kept the code before it working: the older image is that code. So an image serves a schema newer than its own latest migration while:
+
+- every migration since its latest ran live, as the flock's journey (`geese_journey`) says. One that took downtime, or one the flock has no record of, such as a baseline applied by `init`, closes the way back;
+- it declares unused everything those migrations dropped;
+- it serves every capability switched on since, and its release isn't below the oldest page served, as for any goose.
+
+It then runs its own newest code: `flock.Version()` says its latest, not the database's. An image that can't serve the schema isn't let in (`ErrSchemaUnserved`): its pods don't start, and the release before them goes on serving. The way out is forward, with a release that fixes what the rollback was for.
 
 ## Capabilities and the oldest page served
 
@@ -119,7 +129,7 @@ See [capabilities and the oldest page served](capabilities.md) for the server's 
 `flightplan.json`, beside the migrations, read by the image and by the `geese` command:
 
 ```json
-{"maxActiveVersions": 4, "minimumSupportedVersion": 1, "latestMigrationVersion": 3, "minimumServeVersion": 2, "maximumServeVersion": 3}
+{"maxActiveVersions": 4, "minimumSupportedVersion": 1, "latestMigrationVersion": 3, "minimumServeVersion": 2}
 ```
 
 | | |
@@ -128,7 +138,7 @@ See [capabilities and the oldest page served](capabilities.md) for the server's 
 | `minimumSupportedVersion` | The first migration, the **baseline**. A database older than it is migrated by an older release first. |
 | `latestMigrationVersion` | The last migration. |
 | `unused` | The tables and columns this release's code no longer touches, as `table` or `table.column`: [dropping what isn't used](#dropping-what-isnt-used). |
-| `minimumServeVersion`, `maximumServeVersion` | The schema versions this release serves, at most four. It serves the latest, and may serve the ones before it, for a rollout from a release that doesn't have the latest migration yet, and one after it, for a rollback from a release that does. Raising `minimumServeVersion` is raising the window's **floor**. |
+| `minimumServeVersion` | The oldest schema version this release serves, up to the latest, at most four in all. It may serve the ones before the latest, for a rollout from a release that doesn't have the latest migration yet. Raising it is raising the window's **floor**. A rollback needs nothing here: [rolling back](#rolling-back). |
 
 ```sh
 go run github.com/jarensaa/geese/cmd/geese check            # the migration window, in CI
@@ -147,4 +157,4 @@ The command looks for `flightplan.json` at the repository's root, its migrations
 - **Every goose speaks one protocol.** A goose writes the protocol it speaks with every honk, and a leader decides nothing while it hears a goose of another protocol, or a pod of the coordinator geese came from. See [the protocol](../PROTOCOL.md).
 - **Admit all database work.** Work that isn't admitted isn't cancelled when its goose is grounded, so it may run on after the flock stops counting it.
 - **Never migrate a database in use from outside the flock.** The flock migrates it. Offline migration is for recovery, with everything stopped.
-- **A rollback image must serve the schema already applied.** Databases don't go backwards.
+- **Databases don't go backwards.** A rollback runs an older image on the newer schema, across migrations that ran live; past one with downtime, the way out is forward.

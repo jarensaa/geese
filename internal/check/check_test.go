@@ -11,7 +11,7 @@ import (
 
 var layout = Layout{Migrations: "server/db/migrations", Code: "server/db/migrationcode", Source: "server", Tokens: "support"}
 
-var plan = geese.FlightPlan{MaxActiveVersions: 4, MinimumSupportedVersion: 1, LatestMigrationVersion: 4, MinimumServeVersion: 4, MaximumServeVersion: 4}
+var plan = geese.FlightPlan{MaxActiveVersions: 4, MinimumSupportedVersion: 1, LatestMigrationVersion: 4, MinimumServeVersion: 4}
 
 func migrations(versions ...int) []string {
 	paths := []string{}
@@ -40,19 +40,19 @@ func expect(t *testing.T, problems []string, want string) {
 func TestTheMigrationWindow(t *testing.T) {
 	expect(t, Migrations(migrations(1, 2, 3, 4), plan, layout), "")
 	expect(t, Migrations(migrations(1, 2, 3, 4, 5), with(func(p *geese.FlightPlan) {
-		p.LatestMigrationVersion, p.MaximumServeVersion, p.MinimumServeVersion = 5, 5, 5
+		p.LatestMigrationVersion, p.MinimumServeVersion = 5, 5
 	}), layout), "exceed the 4-version cap")
 	baseline := []string{"server/db/migrations/00004_baseline.sql", "server/db/migrations/00005_change.sql"}
 	expect(t, Migrations(baseline, with(func(p *geese.FlightPlan) {
-		p.MinimumSupportedVersion, p.LatestMigrationVersion, p.MinimumServeVersion, p.MaximumServeVersion = 4, 5, 5, 5
+		p.MinimumSupportedVersion, p.LatestMigrationVersion, p.MinimumServeVersion = 4, 5, 5
 	}), layout), "")
 	expect(t, Migrations(migrations(4, 5), with(func(p *geese.FlightPlan) {
-		p.MinimumSupportedVersion, p.LatestMigrationVersion, p.MinimumServeVersion, p.MaximumServeVersion = 4, 5, 5, 5
+		p.MinimumSupportedVersion, p.LatestMigrationVersion, p.MinimumServeVersion = 4, 5, 5
 	}), layout), "complete SQL baseline")
 	expect(t, Migrations(append(migrations(1, 2, 3, 4), "server/db/migrationcode/00005_backfill.go"), plan, layout), "no executor")
 	duplicate := append(migrations(1, 3), "server/db/migrations/00003_other.sql")
 	problems := Migrations(duplicate, with(func(p *geese.FlightPlan) {
-		p.LatestMigrationVersion, p.MinimumServeVersion, p.MaximumServeVersion = 3, 3, 3
+		p.LatestMigrationVersion, p.MinimumServeVersion = 3, 3
 	}), layout)
 	expect(t, problems, "both")
 	expect(t, problems, "consecutive")
@@ -87,7 +87,7 @@ func TestDowntimeIsAllowedAndSaid(t *testing.T) {
 		"server/db/migrations/00003_colour.sql": "-- +goose Up\nALTER TABLE lists ADD COLUMN colour text;",
 	}
 	expect(t, Disruptive(migrations, plan), "")
-	if got := Downtime(migrations, plan); !slices.Equal(got, []string{"server/db/migrations/00002_rename.sql takes the flock down while it runs"}) {
+	if got := Downtime(migrations, plan); !slices.Equal(got, []string{"server/db/migrations/00002_rename.sql takes the flock down while it runs, and the releases before it can't be rolled back to"}) {
 		t.Errorf("%q", got)
 	}
 }

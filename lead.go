@@ -265,7 +265,8 @@ func (f *Flock) fail(ctx context.Context, tx *sql.Tx, current, target int64, why
 	return fmt.Errorf("%w (the flock goes on at %d, and tries again in %s)", why, current, retry)
 }
 
-// finishMigration says the flock has arrived.
+// finishMigration says the flock has arrived, and writes the leg in its
+// journey: whether it ran live, and what it dropped.
 func (f *Flock) finishMigration(ctx context.Context, target int64) error {
 	tx, version, err := f.coordinated(ctx)
 	if err != nil {
@@ -274,6 +275,10 @@ func (f *Flock) finishMigration(ctx context.Context, target int64) error {
 	defer tx.Rollback()
 	if version != target {
 		return fmt.Errorf("geese: the schema is at %d, expected %d", version, target)
+	}
+	if _, err = tx.ExecContext(ctx, `INSERT INTO geese_journey (version,downtime,dropped)
+		SELECT $1,roosting,dropping FROM geese_flight WHERE id=true AND heading_for=$1 ON CONFLICT (version) DO NOTHING`, target); err != nil {
+		return err
 	}
 	if _, err = tx.ExecContext(ctx, `UPDATE geese_flight SET heading_for=NULL,dropping='{}',roosting=false,failed_for=NULL,failures=0,retry_at=NULL,failure=NULL
 		WHERE id=true AND heading_for=$1`, target); err != nil {

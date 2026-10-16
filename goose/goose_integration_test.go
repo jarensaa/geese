@@ -18,7 +18,7 @@ func TestMain(m *testing.M) { geesetest.Main(m) }
 
 var migrations = Migrations{FS: os.DirFS("testdata"), Dir: "migrations"}
 
-var plan = geese.FlightPlan{MaxActiveVersions: 4, MinimumSupportedVersion: 1, LatestMigrationVersion: 2, MinimumServeVersion: 1, MaximumServeVersion: 2}
+var plan = geese.FlightPlan{MaxActiveVersions: 4, MinimumSupportedVersion: 1, LatestMigrationVersion: 2, MinimumServeVersion: 1}
 
 // Outside the flock, Migrate initializes an empty database, and takes a
 // database in use only offline, with no goose flying.
@@ -53,7 +53,7 @@ func TestMigrateOutsideTheFlock(t *testing.T) {
 	}
 
 	// A database newer than the plan knows is refused.
-	if err := Migrate(ctx, url, migrations, geese.FlightPlan{MaxActiveVersions: 4, MinimumSupportedVersion: 1, LatestMigrationVersion: 1, MinimumServeVersion: 1, MaximumServeVersion: 2}, true); err == nil || !strings.Contains(err.Error(), "newer") {
+	if err := Migrate(ctx, url, migrations, geese.FlightPlan{MaxActiveVersions: 4, MinimumSupportedVersion: 1, LatestMigrationVersion: 1, MinimumServeVersion: 1}, true); err == nil || !strings.Contains(err.Error(), "newer") {
 		t.Fatalf("migrated a database newer than the plan: %v", err)
 	}
 }

@@ -30,16 +30,17 @@ type ClearSkies struct{}
 
 func (ClearSkies) Calm(context.Context) (bool, error) { return true, nil }
 
-// Window is the schema versions an image serves, and the latest it can
-// migrate to. It comes from the flight plan (FlightPlan.Window).
+// Window is the schema versions an image serves, from ServeFrom to its latest
+// migration. It comes from the flight plan (FlightPlan.Window). An image also
+// serves a newer schema, as a rollback runs it, while every migration since
+// its latest ran live, and it declares unused what they dropped.
 type Window struct {
 	ServeFrom int64
-	ServeTo   int64
 	Latest    int64
 }
 
 func (w Window) valid() bool {
-	return w.ServeFrom >= 1 && w.ServeTo >= w.ServeFrom && w.Latest >= w.ServeFrom && w.Latest <= w.ServeTo
+	return w.ServeFrom >= 1 && w.Latest >= w.ServeFrom
 }
 
 // Capability is something the API promises once its schema is in place and
@@ -118,6 +119,10 @@ var (
 	// flock: its lease lapsed, or it can't serve the schema or capabilities
 	// the flock has. It serves again once a honk is heard.
 	ErrGrounded = errors.New("geese: grounded, without a place in the flock")
+	// ErrSchemaUnserved is why an image can't join, or is grounded: it
+	// doesn't serve the schema the database has, or where the flock is
+	// heading.
+	ErrSchemaUnserved = errors.New("geese: this image doesn't serve the schema")
 	// ErrRoosting is the answer to work while the flock is down for a
 	// migration that asked for downtime. It serves again once that's done.
 	ErrRoosting = errors.New("geese: the flock is down for a migration")
@@ -405,8 +410,9 @@ func (f *Flock) Capabilities(ctx context.Context) (Capabilities, error) {
 		f.ground()
 		return Capabilities{}, err
 	}
-	if err = f.checkServeVersion(version); err == nil {
-		err = f.checkActiveCapabilities(active, version)
+	serving, err := f.serves(ctx, tx, version)
+	if err == nil {
+		err = f.checkActiveCapabilities(active, serving)
 	}
 	if err != nil {
 		f.ground()
@@ -444,8 +450,7 @@ func (f *Flock) Require(ctx context.Context, name string) error {
 	return err
 }
 
-// checkUnused refuses a migration's drops, as JSON, that this image doesn't
-// declare unused.
+// checkUnused refuses drops, as JSON, that this image doesn't declare unused.
 func (f *Flock) checkUnused(dropping string) error {
 	var drops []string
 	if err := json.Unmarshal([]byte(dropping), &drops); err != nil {
@@ -453,15 +458,37 @@ func (f *Flock) checkUnused(dropping string) error {
 	}
 	for _, name := range drops {
 		if !slices.Contains(f.unused, name) {
-			return fmt.Errorf("geese: the flock is dropping %s, which this image doesn't declare unused", name)
+			return fmt.Errorf("geese: %s is dropped, and this image doesn't declare it unused", name)
 		}
 	}
 	return nil
 }
 
-func (f *Flock) checkServeVersion(version int64) error {
-	if version < f.window.ServeFrom || version > f.window.ServeTo {
-		return fmt.Errorf("geese: database schema version %d is unsupported by this image (it serves %d–%d)", version, f.window.ServeFrom, f.window.ServeTo)
+// serves says which schema version's code this image runs on the schema
+// applied, version, or why it can't serve it. Within its window, that
+// version's own. On a newer schema, as a rollback runs it, its latest: every
+// migration since must have run live, so the code before it kept working,
+// and the image must declare unused what they dropped. A migration the flock
+// has no record of, such as a baseline, counts as one with downtime.
+func (f *Flock) serves(ctx context.Context, tx *sql.Tx, version int64) (int64, error) {
+	if version < f.window.ServeFrom {
+		return 0, fmt.Errorf("%w: version %d is older than it serves (%d–%d)", ErrSchemaUnserved, version, f.window.ServeFrom, f.window.Latest)
 	}
-	return nil
+	if version <= f.window.Latest {
+		return version, nil
+	}
+	var live int64
+	var dropped string
+	if err := tx.QueryRowContext(ctx, `SELECT count(*) FILTER (WHERE NOT downtime),
+		to_json(coalesce((SELECT array_agg(d) FROM geese_journey j, unnest(j.dropped) d WHERE j.version > $1 AND j.version <= $2), '{}'))::text
+		FROM geese_journey WHERE version > $1 AND version <= $2`, f.window.Latest, version).Scan(&live, &dropped); err != nil {
+		return 0, err
+	}
+	if live != version-f.window.Latest {
+		return 0, fmt.Errorf("%w: version %d is newer than it serves (%d–%d), past a migration that didn't run live", ErrSchemaUnserved, version, f.window.ServeFrom, f.window.Latest)
+	}
+	if err := f.checkUnused(dropped); err != nil {
+		return 0, fmt.Errorf("%w: version %d is newer than it serves (%d–%d): %w", ErrSchemaUnserved, version, f.window.ServeFrom, f.window.Latest, err)
+	}
+	return f.window.Latest, nil
 }

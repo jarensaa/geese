@@ -59,7 +59,7 @@ func goose(t *testing.T, ctx context.Context, url, name string) *Flock {
 // join is a goose of a release joining, which may be refused.
 func join(ctx context.Context, url, name, release string) (*Flock, error) {
 	return Join(ctx, Config{DatabaseURL: url, Name: name, Release: release, Weather: ClearSkies{}, Migrator: ledger{},
-		Window: Window{ServeFrom: 1, ServeTo: 2, Latest: 2}})
+		Window: Window{ServeFrom: 1, Latest: 2}})
 }
 
 func oldestPage(t *testing.T, ctx context.Context, live *Flock) string {
@@ -267,7 +267,7 @@ func TestTheFlockCarriesOnFromTheCoordinatorGeeseCameFrom(t *testing.T) {
 	}
 	join := func(release string) (*Flock, error) {
 		return Join(ctx, Config{DatabaseURL: url, Name: "new", Release: release, Weather: ClearSkies{}, Migrator: ledger{},
-			Window: Window{ServeFrom: 1, ServeTo: 2, Latest: 2}, Capabilities: []Capability{{Name: "lists", MinimumSchema: 1}}})
+			Window: Window{ServeFrom: 1, Latest: 2}, Capabilities: []Capability{{Name: "lists", MinimumSchema: 1}}})
 	}
 	if refused, err := join("7.1.0"); err == nil || !strings.Contains(err.Error(), "migrating") {
 		if refused != nil {
@@ -343,7 +343,7 @@ func (s *stalling) Version(ctx context.Context, tx *sql.Tx) (int64, error) {
 func joinStalling(t *testing.T, ctx context.Context, url string, migrator *stalling) *Flock {
 	t.Helper()
 	live, err := Join(ctx, Config{DatabaseURL: url, Name: "stalling", Release: "dev", Weather: ClearSkies{}, Migrator: migrator,
-		Window: Window{ServeFrom: 1, ServeTo: 2, Latest: 2}})
+		Window: Window{ServeFrom: 1, Latest: 2}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -440,7 +440,7 @@ func TestAFailedMigrationLetsTheFlockGoOn(t *testing.T) {
 	conn, url := standIn(t, ctx)
 	migrator := &failing{}
 	leader, err := Join(ctx, Config{DatabaseURL: url, Name: "leader", Release: "dev", Weather: ClearSkies{}, Migrator: migrator,
-		Window: Window{ServeFrom: 1, ServeTo: 2, Latest: 2}})
+		Window: Window{ServeFrom: 1, Latest: 2}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -511,7 +511,7 @@ func (m classified) Change(int64) (Change, error) { return m.change, nil }
 func joinClassified(t *testing.T, ctx context.Context, url, name string, change Change, unused ...string) *Flock {
 	t.Helper()
 	live, err := Join(ctx, Config{DatabaseURL: url, Name: name, Release: "dev", Weather: ClearSkies{}, Migrator: classified{change: change},
-		Window: Window{ServeFrom: 1, ServeTo: 2, Latest: 2}, Unused: unused})
+		Window: Window{ServeFrom: 1, Latest: 2}, Unused: unused})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -573,7 +573,7 @@ func TestADropWaitsForEveryGooseToDeclareItUnused(t *testing.T) {
 		t.Fatal(err)
 	}
 	if late, err := Join(ctx, Config{DatabaseURL: url, Name: "late", Release: "dev", Weather: ClearSkies{}, Migrator: classified{change: drop},
-		Window: Window{ServeFrom: 1, ServeTo: 2, Latest: 2}}); err == nil {
+		Window: Window{ServeFrom: 1, Latest: 2}}); err == nil {
 		late.Land()
 		t.Fatal("a goose that may read the column joined while it's dropped")
 	}
@@ -621,7 +621,7 @@ func TestAMigrationNeverHoldsUpQueries(t *testing.T) {
 		t.Fatal(err)
 	}
 	leader, err := Join(ctx, Config{DatabaseURL: url, Name: "leader", Release: "dev", Weather: ClearSkies{}, Migrator: altering{},
-		Window: Window{ServeFrom: 1, ServeTo: 2, Latest: 2}})
+		Window: Window{ServeFrom: 1, Latest: 2}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -717,7 +717,7 @@ func TestAMigrationWithDowntime(t *testing.T) {
 	migrator := recording{ran: make(chan time.Time, 1)}
 	join := func(name string) *Flock {
 		live, err := Join(ctx, Config{DatabaseURL: url, Name: name, Release: "dev", Weather: ClearSkies{}, Migrator: migrator,
-			Window: Window{ServeFrom: 1, ServeTo: 2, Latest: 2}})
+			Window: Window{ServeFrom: 1, Latest: 2}})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -750,5 +750,57 @@ func TestAMigrationWithDowntime(t *testing.T) {
 		t.Fatalf("not serving at 2 after the migration: version %d, %v", other.Version(), err)
 	} else {
 		again()
+	}
+}
+
+// An older image serves a schema newer than its own, as a rollback runs it,
+// while every migration since its own ran live, and it declares unused what
+// they dropped: a migration that ran live kept the code before it working.
+func TestRollingBackAcrossLiveMigrations(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	conn, url := standIn(t, ctx)
+	newer := joinClassified(t, ctx, url, "newer", Change{Drops: []string{"lists.archived"}}, "lists.archived")
+	if err := newer.TryMigrate(ctx); err != nil || newer.Version() != 2 {
+		t.Fatalf("migrated to %d: %v", newer.Version(), err)
+	}
+	newer.Land()
+
+	older := func(unused ...string) (*Flock, error) {
+		return Join(ctx, Config{DatabaseURL: url, Name: "older", Release: "dev", Weather: ClearSkies{}, Migrator: ledger{},
+			Window: Window{ServeFrom: 1, Latest: 1}, Unused: unused})
+	}
+	if old, err := older(); !errors.Is(err, ErrSchemaUnserved) {
+		if old != nil {
+			old.Land()
+		}
+		t.Fatalf("an image that may read a column dropped since joined: %v", err)
+	}
+	old, err := older("lists.archived")
+	if err != nil {
+		t.Fatalf("an image rolled back to across a live migration: %v", err)
+	}
+	if old.Version() != 1 {
+		t.Fatalf("it runs its code for %d, not its newest", old.Version())
+	}
+	if _, release, err := old.Admit(ctx); err != nil {
+		t.Fatal(err)
+	} else {
+		release()
+	}
+	old.Land()
+
+	// A migration with downtime since closes the way back, as does one the
+	// flock has no record of.
+	for _, change := range []string{`UPDATE geese_journey SET downtime=true`, `DELETE FROM geese_journey`} {
+		if _, err := conn.ExecContext(ctx, change); err != nil {
+			t.Fatal(err)
+		}
+		if old, err := older("lists.archived"); !errors.Is(err, ErrSchemaUnserved) {
+			if old != nil {
+				old.Land()
+			}
+			t.Fatalf("after %q, an image older than the schema joined: %v", change, err)
+		}
 	}
 }

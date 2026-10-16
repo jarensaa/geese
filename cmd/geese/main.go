@@ -191,7 +191,7 @@ func checkRepository(planPath string, layout check.Layout, staged bool) error {
 			active++
 		}
 	}
-	fmt.Printf("Flight plan OK: %d of %d active migrations, serving %d–%d.\n", active, plan.MaxActiveVersions, plan.MinimumServeVersion, plan.MaximumServeVersion)
+	fmt.Printf("Flight plan OK: %d of %d active migrations, serving %d–%d.\n", active, plan.MaxActiveVersions, plan.MinimumServeVersion, plan.LatestMigrationVersion)
 	for _, line := range check.Downtime(sql, plan) {
 		fmt.Println("  " + line)
 	}

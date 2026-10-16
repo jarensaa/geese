@@ -116,7 +116,7 @@ DROP TABLE greetings;
 `flightplan.json`, the flight plan: the migrations the repository has (the first, its baseline, to the latest), and the schema versions this release serves. Here that's all just version 1; [how geese works](concepts.md#the-flight-plan) explains each number.
 
 ```json
-{"maxActiveVersions": 4, "minimumSupportedVersion": 1, "latestMigrationVersion": 1, "minimumServeVersion": 1, "maximumServeVersion": 1}
+{"maxActiveVersions": 4, "minimumSupportedVersion": 1, "latestMigrationVersion": 1, "minimumServeVersion": 1}
 ```
 
 What `main` does, in order:
@@ -169,7 +169,7 @@ ALTER TABLE greetings DROP COLUMN language;
 `flightplan.json` now has 2 as its latest migration, and the release serves 1 to 2:
 
 ```json
-{"maxActiveVersions": 4, "minimumSupportedVersion": 1, "latestMigrationVersion": 2, "minimumServeVersion": 1, "maximumServeVersion": 2}
+{"maxActiveVersions": 4, "minimumSupportedVersion": 1, "latestMigrationVersion": 2, "minimumServeVersion": 1}
 ```
 
 Code that must differ between schema 1 and schema 2 branches on `flock.Version()`; this example has none. Set `Release` to `"1.1.0"`, build, and roll out one process at a time, the way Kubernetes would:

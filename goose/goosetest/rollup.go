@@ -5,6 +5,7 @@ package goosetest
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"io/fs"
 	"reflect"
@@ -160,7 +161,7 @@ func RollupKeepsSchema(t *testing.T, r Rollup) {
 		if err := mainMigrations.MigrateTo(ctx, older, olderVersion); err != nil {
 			t.Fatal(err)
 		}
-		if refused, err := geese.Join(ctx, geese.Config{DatabaseURL: olderURL, Window: r.Plan.Window(), Weather: geese.ClearSkies{}, Migrator: r.Branch}); err == nil || !strings.Contains(err.Error(), "unsupported") {
+		if refused, err := geese.Join(ctx, geese.Config{DatabaseURL: olderURL, Window: r.Plan.Window(), Weather: geese.ClearSkies{}, Migrator: r.Branch}); !errors.Is(err, geese.ErrSchemaUnserved) {
 			if refused != nil {
 				refused.Land()
 			}

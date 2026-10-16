@@ -34,7 +34,7 @@ func repo(t *testing.T, planPath, plan string, files map[string]string) string {
 	return root
 }
 
-const plan = `{"maxActiveVersions":4,"minimumSupportedVersion":1,"latestMigrationVersion":2,"minimumServeVersion":1,"maximumServeVersion":2}`
+const plan = `{"maxActiveVersions":4,"minimumSupportedVersion":1,"latestMigrationVersion":2,"minimumServeVersion":1}`
 
 // With no flags, the plan is flightplan.json at the root, and the rest is
 // beside it.

@@ -40,8 +40,8 @@ func (f *Flock) bootstrap(ctx context.Context) error {
 		return fmt.Errorf("geese: read the schema version (initialize a fresh database before serving): %w", err)
 	}
 	defer tx.Rollback()
-	if err := f.checkServeVersion(version); err != nil {
-		return err
+	if version < f.window.ServeFrom {
+		return fmt.Errorf("%w: version %d is older than it serves (%d–%d)", ErrSchemaUnserved, version, f.window.ServeFrom, f.window.Latest)
 	}
 	if _, err = tx.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS geese_flock (
 		id            uuid        PRIMARY KEY,
@@ -69,6 +69,16 @@ func (f *Flock) bootstrap(ctx context.Context) error {
 		failures            integer     NOT NULL DEFAULT 0,
 		retry_at            timestamptz,
 		failure             text
+	)`); err != nil {
+		return err
+	}
+	// geese_journey is every migration the flock ran: how far back an image may
+	// be rolled.
+	if _, err = tx.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS geese_journey (
+		version    bigint      PRIMARY KEY,
+		downtime   boolean     NOT NULL,
+		dropped    text[]      NOT NULL DEFAULT '{}',
+		arrived_at timestamptz NOT NULL DEFAULT clock_timestamp()
 	)`); err != nil {
 		return err
 	}
@@ -161,13 +171,16 @@ func (f *Flock) Honk(ctx context.Context) error {
 	// A goose that can't serve where the flock is heading, or that may still
 	// use what the migration drops, stays on the ground: the leader checked
 	// the geese it heard, and this one joins the flock while it migrates.
-	if err = f.checkServeVersion(version); err == nil && heading.Valid && version < heading.Int64 {
-		if err = f.checkServeVersion(heading.Int64); err == nil {
-			err = f.checkUnused(dropping)
+	serving, err := f.serves(ctx, tx, version)
+	if err == nil && heading.Valid && version < heading.Int64 {
+		if heading.Int64 > f.window.Latest {
+			err = fmt.Errorf("%w: the flock is migrating to %d, newer than it serves (%d–%d)", ErrSchemaUnserved, heading.Int64, f.window.ServeFrom, f.window.Latest)
+		} else if err = f.checkUnused(dropping); err != nil {
+			err = fmt.Errorf("%w: %w", ErrSchemaUnserved, err)
 		}
 	}
 	if err == nil {
-		err = f.checkActiveCapabilities(active, version)
+		err = f.checkActiveCapabilities(active, serving)
 	}
 	if err == nil {
 		err = f.checkRelease(floor)
@@ -185,7 +198,7 @@ func (f *Flock) Honk(ctx context.Context) error {
 	if _, err = tx.ExecContext(ctx, `INSERT INTO geese_flock (id,name,protocol,serves_from,serves_to,capabilities,unused,release_major,roosted_for,heard_until)
 		VALUES ($1,$2,$3,$4,$5,$6::text[],$7::text[],$8,$9,clock_timestamp()+$10::interval)
 		ON CONFLICT (id) DO UPDATE SET capabilities=EXCLUDED.capabilities,roosted_for=EXCLUDED.roosted_for,heard_until=EXCLUDED.heard_until`,
-		f.id, f.name, protocol, f.window.ServeFrom, f.window.ServeTo, f.supportedNames(), f.unused, f.release, roostedFor, leaseFor.String()); err != nil {
+		f.id, f.name, protocol, f.window.ServeFrom, f.window.Latest, f.supportedNames(), f.unused, f.release, roostedFor, leaseFor.String()); err != nil {
 		f.ground()
 		return err
 	}
@@ -193,7 +206,7 @@ func (f *Flock) Honk(ctx context.Context) error {
 		f.ground()
 		return err
 	}
-	f.version.Store(version)
+	f.version.Store(serving)
 	f.headingSet.Store(heading.Valid)
 	if !f.keepUntil(epoch, honked.Add(ownDeadline)) {
 		return errGroundedMidHonk

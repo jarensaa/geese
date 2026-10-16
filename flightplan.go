@@ -1,6 +1,7 @@
 package geese
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -18,10 +19,11 @@ import (
 //   - MinimumSupportedVersion: the first active migration, the baseline. A
 //     database older than it must be migrated by an older release first.
 //   - LatestMigrationVersion: the last migration.
-//   - MinimumServeVersion and MaximumServeVersion: the schema versions the
-//     image serves, at most four. It serves the latest, and may serve the
-//     ones before it (for a rollout from an image that doesn't migrate yet)
-//     and one after it (for a rollback from one that already has).
+//   - MinimumServeVersion: the oldest schema version the image serves, up to
+//     the latest, at most four. It may serve the ones before the latest, for
+//     a rollout from an image that doesn't have the latest migration yet. A
+//     rollback is the flock's business: an image serves a newer schema while
+//     every migration since its latest ran live.
 //   - Unused: the tables ("invites") and columns ("lists.archived") the
 //     image's code no longer touches (Config.Unused). A migration that drops
 //     them runs once every goose heard declares them.
@@ -30,7 +32,6 @@ type FlightPlan struct {
 	MinimumSupportedVersion int64    `json:"minimumSupportedVersion"`
 	LatestMigrationVersion  int64    `json:"latestMigrationVersion"`
 	MinimumServeVersion     int64    `json:"minimumServeVersion"`
-	MaximumServeVersion     int64    `json:"maximumServeVersion"`
 	Unused                  []string `json:"unused,omitempty"`
 }
 
@@ -41,10 +42,13 @@ var unusedName = regexp.MustCompile(`^[^\s.]+(\.[^\s.]+){0,2}$`)
 // flight plan may have.
 const MaxActive = 4
 
-// ParseFlightPlan reads a flight plan and checks it holds together.
+// ParseFlightPlan reads a flight plan and checks it holds together. A key it
+// doesn't know is an error, so a misspelt one isn't silently ignored.
 func ParseFlightPlan(data []byte) (FlightPlan, error) {
 	var plan FlightPlan
-	if err := json.Unmarshal(data, &plan); err != nil {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&plan); err != nil {
 		return plan, fmt.Errorf("geese: parse the flight plan: %w", err)
 	}
 	return plan, plan.Validate()
@@ -70,9 +74,9 @@ func (p FlightPlan) Validate() error {
 		return fmt.Errorf("geese: latestMigrationVersion is at least minimumSupportedVersion")
 	case p.MinimumServeVersion < p.MinimumSupportedVersion:
 		return fmt.Errorf("geese: minimumServeVersion is at least minimumSupportedVersion")
-	case p.MinimumServeVersion > p.LatestMigrationVersion || p.MaximumServeVersion < p.LatestMigrationVersion:
-		return fmt.Errorf("geese: the serving window includes latestMigrationVersion")
-	case p.MaximumServeVersion-p.MinimumServeVersion+1 > MaxActive:
+	case p.MinimumServeVersion > p.LatestMigrationVersion:
+		return fmt.Errorf("geese: minimumServeVersion is at most latestMigrationVersion")
+	case p.LatestMigrationVersion-p.MinimumServeVersion+1 > MaxActive:
 		return fmt.Errorf("geese: the serving window is at most %d versions", MaxActive)
 	}
 	for _, name := range p.Unused {
@@ -85,7 +89,7 @@ func (p FlightPlan) Validate() error {
 
 // Window is what an image of this plan serves and migrates to.
 func (p FlightPlan) Window() Window {
-	return Window{ServeFrom: p.MinimumServeVersion, ServeTo: p.MaximumServeVersion, Latest: p.LatestMigrationVersion}
+	return Window{ServeFrom: p.MinimumServeVersion, Latest: p.LatestMigrationVersion}
 }
 
 // CheckMigratable refuses a database this plan's migrations can't take on:
