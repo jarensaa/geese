@@ -7,7 +7,10 @@ import (
 	"fmt"
 	"log/slog"
 	"slices"
+	"strings"
 	"time"
+
+	"github.com/jackc/pgx/v5/stdlib"
 )
 
 // One goose leads at a time: whoever holds the leader's lock, and only in calm
@@ -72,11 +75,12 @@ func (f *Flock) unanimous(ctx context.Context, tx *sql.Tx) error {
 }
 
 // TryMigrate migrates the schema at most one version, when this goose leads,
-// the weather is calm, every goose heard serves the next version, and all of
-// them have gathered. It sets the flock's heading first, which each goose
-// hears on its next honk and gathers for. A flock that doesn't gather in time,
-// or a migration that fails, goes on at the schema applied, and the next
-// attempt waits (retryAfter).
+// the weather is calm, and every goose heard serves the next version. It sets
+// the flock's heading first, which each goose hears on its next honk. Unless
+// code already serving keeps working through the migration (pauses), every
+// goose gathers for it, and the leader migrates once all of them have. A
+// flock that doesn't gather in time, or a migration that fails, goes on at the
+// schema applied, and the next attempt waits (retryAfter).
 func (f *Flock) TryMigrate(ctx context.Context) error {
 	if f.Version() >= f.window.Latest && !f.headingSet.Load() {
 		return nil
@@ -126,14 +130,32 @@ func (f *Flock) TryMigrate(ctx context.Context) error {
 	if unable > 0 {
 		return nil
 	}
-	if _, err = tx.ExecContext(ctx, `UPDATE geese_flight SET heading_for=$1,departed_at=clock_timestamp() WHERE id=true`, target); err != nil {
+	why, err := f.pauses(ctx, tx, target, failedFor.Valid && failedFor.Int64 == target)
+	if err != nil {
+		return err
+	}
+	if _, err = tx.ExecContext(ctx, `UPDATE geese_flight SET heading_for=$1,departed_at=clock_timestamp(),pausing=$2 WHERE id=true`, target, why != ""); err != nil {
 		return err
 	}
 	if err = tx.Commit(); err != nil {
 		return err
 	}
-	if err = f.awaitGathered(ctx, target); err == nil {
-		if err = f.migrator.MigrateTo(ctx, f.db, target); err == nil {
+	db := f.db
+	if why != "" {
+		slog.Info("geese: migrating with a pause", "target", target, "why", why)
+		err = f.awaitGathered(ctx, target)
+	} else {
+		// Without a pause, a migration waiting for a lock would hold up the
+		// queries queued behind it: it gives up instead, and the next attempt
+		// pauses.
+		slog.Info("geese: migrating without a pause", "target", target)
+		config := f.dbConfig.Copy()
+		config.RuntimeParams["lock_timeout"] = fmt.Sprintf("%dms", lockTimeout.Milliseconds())
+		db = stdlib.OpenDB(*config)
+		defer db.Close()
+	}
+	if err == nil {
+		if err = f.migrator.MigrateTo(ctx, db, target); err == nil {
 			return f.finishMigration(ctx, target)
 		}
 		err = fmt.Errorf("geese: migrate to %d: %w", target, err)
@@ -149,6 +171,37 @@ func (f *Flock) TryMigrate(ctx context.Context) error {
 		return fmt.Errorf("%w (the flock goes on at %d, and tries again in %s)", err, current, retry)
 	}
 	return err
+}
+
+// pauses says why the flock pauses for the migration to target, or nothing
+// when code already serving keeps working through it: the migrator says what
+// it changes, every goose heard declares unused what it drops, and no attempt
+// at it has failed. One that did, such as one that gave up waiting for a lock,
+// tries again with a pause.
+func (f *Flock) pauses(ctx context.Context, tx *sql.Tx, target int64, failed bool) (string, error) {
+	if failed {
+		return "the last attempt failed", nil
+	}
+	classifier, ok := f.migrator.(Classifier)
+	if !ok {
+		return "the migrator doesn't say what its migrations change", nil
+	}
+	change, err := classifier.Change(target)
+	if err != nil {
+		return "", err
+	}
+	if change.Pause != "" || len(change.Drops) == 0 {
+		return change.Pause, nil
+	}
+	var undeclared int
+	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM geese_flock WHERE heard_until > clock_timestamp() AND NOT (unused @> $1::text[])`,
+		change.Drops).Scan(&undeclared); err != nil {
+		return "", err
+	}
+	if undeclared > 0 {
+		return fmt.Sprintf("%d geese heard don't declare %s unused", undeclared, strings.Join(change.Drops, ", ")), nil
+	}
+	return "", nil
 }
 
 // awaitGathered waits until every goose heard has gathered for target.

@@ -83,3 +83,7 @@ enableRobotsTXT = false
   name = "A failed migration"
   pageRef = "/docs/decisions/0004-a-failed-migration"
   weight = 40
+[[menus.decisions]]
+  name = "Pausing only when it must"
+  pageRef = "/docs/decisions/0005-pausing-only-when-it-must"
+  weight = 50

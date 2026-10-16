@@ -52,6 +52,7 @@ func (f *Flock) bootstrap(ctx context.Context) error {
 		serves_from   bigint      NOT NULL,
 		serves_to     bigint      NOT NULL,
 		capabilities  text[]      NOT NULL DEFAULT '{}',
+		unused        text[]      NOT NULL DEFAULT '{}',
 		release_major bigint,
 		gathered_for  bigint,
 		heard_until   timestamptz NOT NULL,
@@ -63,6 +64,7 @@ func (f *Flock) bootstrap(ctx context.Context) error {
 		id                  boolean     PRIMARY KEY DEFAULT true CHECK (id),
 		heading_for         bigint,
 		departed_at         timestamptz,
+		pausing             boolean     NOT NULL DEFAULT true,
 		active_capabilities text[]      NOT NULL DEFAULT '{}',
 		oldest_page_major   bigint,
 		failed_for          bigint,
@@ -148,7 +150,8 @@ func (f *Flock) Honk(ctx context.Context) error {
 	defer tx.Rollback()
 	var heading, floor sql.NullInt64
 	var encoded string
-	if err = tx.QueryRowContext(ctx, `SELECT heading_for,to_json(active_capabilities)::text,oldest_page_major FROM geese_flight WHERE id=true`).Scan(&heading, &encoded, &floor); err != nil {
+	var pausing bool
+	if err = tx.QueryRowContext(ctx, `SELECT heading_for,pausing,to_json(active_capabilities)::text,oldest_page_major FROM geese_flight WHERE id=true`).Scan(&heading, &pausing, &encoded, &floor); err != nil {
 		f.ground()
 		return err
 	}
@@ -172,16 +175,17 @@ func (f *Flock) Honk(ctx context.Context) error {
 		f.ground()
 		return err
 	}
-	// A heading ahead of the applied schema is a migration about to run: gather for it.
-	migrating := heading.Valid && version < heading.Int64
+	// A heading ahead of the applied schema is a migration about to run:
+	// gather for it, unless the flock needn't pause for it.
+	migrating := heading.Valid && version < heading.Int64 && pausing
 	var gatheredFor sql.NullInt64
 	if migrating && f.gatherFor(heading.Int64) {
 		gatheredFor = heading
 	}
-	if _, err = tx.ExecContext(ctx, `INSERT INTO geese_flock (id,name,protocol,serves_from,serves_to,capabilities,release_major,gathered_for,heard_until)
-		VALUES ($1,$2,$3,$4,$5,$6::text[],$7,$8,clock_timestamp()+$9::interval)
+	if _, err = tx.ExecContext(ctx, `INSERT INTO geese_flock (id,name,protocol,serves_from,serves_to,capabilities,unused,release_major,gathered_for,heard_until)
+		VALUES ($1,$2,$3,$4,$5,$6::text[],$7::text[],$8,$9,clock_timestamp()+$10::interval)
 		ON CONFLICT (id) DO UPDATE SET capabilities=EXCLUDED.capabilities,gathered_for=EXCLUDED.gathered_for,heard_until=EXCLUDED.heard_until`,
-		f.id, f.name, protocol, f.window.ServeFrom, f.window.ServeTo, f.supportedNames(), f.release, gatheredFor, leaseFor.String()); err != nil {
+		f.id, f.name, protocol, f.window.ServeFrom, f.window.ServeTo, f.supportedNames(), f.unused, f.release, gatheredFor, leaseFor.String()); err != nil {
 		f.ground()
 		return err
 	}

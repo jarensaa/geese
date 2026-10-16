@@ -118,6 +118,44 @@ func Transactional(migrations map[string]string, plan geese.FlightPlan) []string
 	return problems
 }
 
+// Pauses says, of each migration the flock would run (after the baseline),
+// whether the flock will pause for it, and why: for review, not a problem.
+func Pauses(migrations map[string]string, plan geese.FlightPlan) []string {
+	paths := make([]string, 0, len(migrations))
+	for path := range migrations {
+		paths = append(paths, path)
+	}
+	slices.Sort(paths)
+	declared := map[string]bool{}
+	for _, name := range plan.Unused {
+		declared[name] = true
+	}
+	var lines []string
+	for _, path := range paths {
+		_, name := split(path)
+		match := versionedName.FindStringSubmatch(name)
+		if match == nil {
+			continue
+		}
+		if version, err := strconv.ParseInt(match[1], 10, 64); err != nil || version <= plan.MinimumSupportedVersion {
+			continue
+		}
+		change := goose.Classify([]byte(migrations[path]))
+		undeclared := slices.DeleteFunc(slices.Clone(change.Drops), func(name string) bool { return declared[name] })
+		switch {
+		case change.Pause != "":
+			lines = append(lines, fmt.Sprintf("%s pauses the flock: %s", name, change.Pause))
+		case len(undeclared) > 0:
+			lines = append(lines, fmt.Sprintf("%s pauses the flock: the flight plan doesn't declare %s unused", name, strings.Join(undeclared, ", ")))
+		case len(change.Drops) > 0:
+			lines = append(lines, fmt.Sprintf("%s needs no pause, once every image running declares %s unused", name, strings.Join(change.Drops, ", ")))
+		default:
+			lines = append(lines, name+" needs no pause")
+		}
+	}
+	return lines
+}
+
 // Compatibility checks each compatibility file: code kept for an older
 // schema version the image still serves, named compat_vNNNN.go (or
 // compat_vNNNN_<what>.go). It must be within the serving window and name the

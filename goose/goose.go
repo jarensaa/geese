@@ -24,6 +24,8 @@ import (
 	"github.com/jarensaa/geese"
 )
 
+var _ geese.Classifier = Migrations{}
+
 // DefaultTable is goose's own ledger of the migrations it applied.
 const DefaultTable = "goose_db_version"
 
@@ -98,6 +100,29 @@ func (m Migrations) MigrateTo(ctx context.Context, db *sql.DB, target int64) err
 	}
 	_, err = provider.UpTo(ctx, target)
 	return err
+}
+
+// Change says what the migration to target does to code already serving
+// (Classify), so the flock pauses only when it must.
+func (m Migrations) Change(target int64) (geese.Change, error) {
+	dir, err := fs.Sub(m.FS, m.Dir)
+	if err != nil {
+		return geese.Change{}, err
+	}
+	names, err := fs.Glob(dir, "*.sql")
+	if err != nil {
+		return geese.Change{}, err
+	}
+	for _, name := range names {
+		if version, err := pressly.NumericComponent(name); err == nil && version == target {
+			migration, err := fs.ReadFile(dir, name)
+			if err != nil {
+				return geese.Change{}, err
+			}
+			return Classify(migration), nil
+		}
+	}
+	return geese.Change{}, fmt.Errorf("goose: no migration %d in %s", target, m.Dir)
 }
 
 // noTransaction is goose's annotation for a migration it runs outside a

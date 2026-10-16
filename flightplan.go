@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"regexp"
 )
 
 // FlightPlan is an application's migration window, kept in its repository
@@ -21,13 +22,20 @@ import (
 //     image serves, at most four. It serves the latest, and may serve the
 //     ones before it (for a rollout from an image that doesn't migrate yet)
 //     and one after it (for a rollback from one that already has).
+//   - Unused: the tables ("invites") and columns ("lists.archived") the
+//     image's code no longer touches (Config.Unused). A migration that drops
+//     them applies without a pause once every goose heard declares them.
 type FlightPlan struct {
-	MaxActiveVersions       int   `json:"maxActiveVersions"`
-	MinimumSupportedVersion int64 `json:"minimumSupportedVersion"`
-	LatestMigrationVersion  int64 `json:"latestMigrationVersion"`
-	MinimumServeVersion     int64 `json:"minimumServeVersion"`
-	MaximumServeVersion     int64 `json:"maximumServeVersion"`
+	MaxActiveVersions       int      `json:"maxActiveVersions"`
+	MinimumSupportedVersion int64    `json:"minimumSupportedVersion"`
+	LatestMigrationVersion  int64    `json:"latestMigrationVersion"`
+	MinimumServeVersion     int64    `json:"minimumServeVersion"`
+	MaximumServeVersion     int64    `json:"maximumServeVersion"`
+	Unused                  []string `json:"unused,omitempty"`
 }
+
+// unusedName is a table or a column, as table.column, either maybe in a schema.
+var unusedName = regexp.MustCompile(`^[^\s.]+(\.[^\s.]+){0,2}$`)
 
 // MaxActive is the most active migrations, and the widest serving window, a
 // flight plan may have.
@@ -51,7 +59,7 @@ func ReadFlightPlan(path string) (FlightPlan, error) {
 	return ParseFlightPlan(data)
 }
 
-// Validate checks the plan's numbers hold together.
+// Validate checks the plan's numbers hold together, and its unused names are names.
 func (p FlightPlan) Validate() error {
 	switch {
 	case p.MaxActiveVersions < 1 || p.MaxActiveVersions > MaxActive:
@@ -66,6 +74,11 @@ func (p FlightPlan) Validate() error {
 		return fmt.Errorf("geese: the serving window includes latestMigrationVersion")
 	case p.MaximumServeVersion-p.MinimumServeVersion+1 > MaxActive:
 		return fmt.Errorf("geese: the serving window is at most %d versions", MaxActive)
+	}
+	for _, name := range p.Unused {
+		if !unusedName.MatchString(name) {
+			return fmt.Errorf("geese: unused %q isn't a table or table.column", name)
+		}
 	}
 	return nil
 }

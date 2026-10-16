@@ -12,12 +12,13 @@
 
 [Documentation](https://jarensaa.github.io/geese/) · [Getting started](docs/getting-started.md) · [Go reference](https://pkg.go.dev/github.com/jarensaa/geese)
 
-Migration tools like [goose](https://github.com/pressly/goose) apply migrations. geese decides **when**. Your processes fly as a flock: each one says, in the database, which schema versions it can serve; one leads; and the flock migrates only once every process can make the journey and has stopped what it was doing. It runs inside your application, with no Job, operator or sidecar.
+Migration tools like [goose](https://github.com/pressly/goose) apply migrations. geese decides **when**. Your processes fly as a flock: each one says, in the database, which schema versions it can serve; one leads; and the flock migrates only once every process can make the journey, pausing them for a moment only when the migration could break the code they run. It runs inside your application, with no Job, operator or sidecar.
 
 ## Features
 
 - **Migrations during rolling deploys.** One version at a time, once every running process serves the next version and the rollout has settled.
-- **Nothing runs old code against a new schema.** Before a migration, every process holds new requests and finishes what's in flight; held requests then run on the new code. A migration may drop what the previous release read.
+- **Pauses only when it must.** Adding a table or a nullable column applies while every process serves. A migration that could break running code pauses the flock instead: every process holds new requests and finishes what's in flight, and held requests then run on the new code, so nothing runs old code against a new schema.
+- **Drops without a pause, provably.** Each image declares the columns and tables its code no longer touches, and its tests run without them. Once every running image declares a column unused, dropping it needs no pause.
 - **Leader election built in**, with PostgreSQL advisory locks. If the leader dies mid-migration, the next one finishes.
 - **Features switch on everywhere at once.** A capability activates when its schema is in place and every process serves it, so processes never disagree about what a client may use.
 - **Stale clients reload.** The deployment says the oldest release whose clients it still serves, so a cached web app never calls an API that's gone.
@@ -85,6 +86,7 @@ func main() {
 		Name:        os.Getenv("HOSTNAME"),
 		Release:     "1.0.0", // this build's version
 		Window:      plan.Window(),
+		Unused:      plan.Unused,        // what its code no longer touches, so dropping it needs no pause
 		Weather:     geese.ClearSkies{}, // under Kubernetes, the Deployment's rollout: kube.InCluster
 		Migrator:    migrations,
 	})
@@ -128,7 +130,7 @@ Run `go mod tidy`, then `quickstart init` once to set up an empty database, then
 
 ## How it works
 
-Every two seconds, each process (a *goose*) writes a row in the database saying which schema versions it serves. One goose holds an advisory lock and *leads*, but only once the deployment has settled. When every goose it hears serves the next version, the leader sets a *heading*. Every goose *gathers*: it holds new requests and finishes those in flight. The leader migrates, and the held requests run on the new code. The whole stop takes a few seconds.
+Every two seconds, each process (a *goose*) writes a row in the database saying which schema versions it serves. One goose holds an advisory lock and *leads*, but only once the deployment has settled. When every goose it hears serves the next version, the leader sets a *heading* and migrates. If the migration could break the code running, every goose first *gathers*: it holds new requests and finishes those in flight, and the held requests run on the new code once the leader has migrated. That stop takes a few seconds; most migrations don't need it.
 
 Read [how geese works](docs/concepts.md) for the details, and [the protocol](PROTOCOL.md) for exactly what the processes write and assume of each other.
 
@@ -167,7 +169,7 @@ The guides are on [the documentation site](https://jarensaa.github.io/geese/), a
 - [Capabilities and the oldest page served](docs/capabilities.md)
 - [Transports: HTTP, gRPC and more](docs/transports.md)
 - [The protocol](PROTOCOL.md)
-- Design decisions: [live schema migrations](docs/decisions/0001-live-schema-migrations.md), [capabilities](docs/decisions/0002-capabilities.md), [the oldest page served](docs/decisions/0003-oldest-page-served.md), [a failed migration](docs/decisions/0004-a-failed-migration.md)
+- Design decisions: [live schema migrations](docs/decisions/0001-live-schema-migrations.md), [capabilities](docs/decisions/0002-capabilities.md), [the oldest page served](docs/decisions/0003-oldest-page-served.md), [a failed migration](docs/decisions/0004-a-failed-migration.md), [pausing only when it must](docs/decisions/0005-pausing-only-when-it-must.md)
 
 ## Status
 

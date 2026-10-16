@@ -2,6 +2,7 @@ package check
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 
@@ -67,6 +68,26 @@ func TestTheFlockMigratesOnlyInATransaction(t *testing.T) {
 	expect(t, Transactional(map[string]string{"server/db/migrations/00002_index.sql": outside}, plan), "00002_index.sql: runs outside a transaction")
 	// The baseline is applied to an empty database, outside the flock.
 	expect(t, Transactional(map[string]string{"server/db/migrations/00001_baseline.sql": outside}, plan), "")
+}
+
+func TestPauses(t *testing.T) {
+	declares := with(func(p *geese.FlightPlan) { p.Unused = []string{"lists.archived"} })
+	got := Pauses(map[string]string{
+		"server/db/migrations/00001_baseline.sql": "-- +goose Up\nUPDATE lists SET name = 'x';",
+		"server/db/migrations/00002_colour.sql":   "-- +goose Up\nALTER TABLE lists ADD COLUMN colour text;",
+		"server/db/migrations/00003_archive.sql":  "-- +goose Up\nALTER TABLE lists DROP COLUMN archived;",
+		"server/db/migrations/00004_invites.sql":  "-- +goose Up\nDROP TABLE invites;",
+		"server/db/migrations/00005_rename.sql":   "-- +goose Up\nALTER TABLE lists RENAME name TO title;",
+	}, declares)
+	want := []string{
+		"00002_colour.sql needs no pause",
+		"00003_archive.sql needs no pause, once every image running declares lists.archived unused",
+		"00004_invites.sql pauses the flock: the flight plan doesn't declare invites unused",
+		`00005_rename.sql pauses the flock: geese can't tell code already serving keeps working through "ALTER TABLE lists RENAME name TO title"`,
+	}
+	if !slices.Equal(got, want) {
+		t.Errorf("got\n%s\nwant\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+	}
 }
 
 func TestCompatibilityFilesNameTheirToken(t *testing.T) {

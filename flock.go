@@ -66,6 +66,25 @@ type Migrator interface {
 	MigrateTo(ctx context.Context, db *sql.DB, target int64) error
 }
 
+// Change is what a migration does to code already serving the schema before
+// it: whether the flock must pause for it, and what it drops.
+type Change struct {
+	// Pause says why the flock pauses for the migration: why code already
+	// serving might not keep working while it applies. Empty, it applies while
+	// the flock serves, as adding a table or a nullable column does.
+	Pause string
+	// Drops are the tables ("invites") and columns ("lists.archived") it
+	// drops. Without a pause, every goose heard must declare each unused.
+	Drops []string
+}
+
+// Classifier is a Migrator that says what each migration changes, so the
+// flock pauses only for those that need it. The flock pauses for every
+// migration of a Migrator that isn't one. Package goose's is.
+type Classifier interface {
+	Change(target int64) (Change, error)
+}
+
 // Config is what a process brings to the flock.
 type Config struct {
 	DatabaseURL string
@@ -85,6 +104,11 @@ type Config struct {
 	// database and older geese still name them active, so this image accepts
 	// and advertises them, but never reports them: nothing checks them any more.
 	Retired []string
+	// Unused are the tables ("invites") and columns ("lists.archived") this
+	// image's code never touches, as its flight plan declares. A migration
+	// that drops them applies without a pause once every goose heard declares
+	// them unused.
+	Unused []string
 }
 
 var (
@@ -131,6 +155,8 @@ const (
 	holdLimit     = 60 * time.Second
 	retryAfter    = 30 * time.Second
 	retryLimit    = 10 * time.Minute
+	// lockTimeout is how long a migration without a pause waits for a lock.
+	lockTimeout = time.Second
 )
 
 // retryIn is how long the next attempt waits after failures in a row.
@@ -164,6 +190,8 @@ type Flock struct {
 	migrator     Migrator
 	capabilities []Capability
 	retired      map[string]bool
+	unused       []string
+	dbConfig     *pgx.ConnConfig
 
 	ready        atomic.Bool
 	deadline     atomic.Pointer[time.Time]
@@ -208,6 +236,11 @@ func Join(ctx context.Context, config Config) (*Flock, error) {
 		seen[name] = true
 		retired[name] = true
 	}
+	for _, name := range config.Unused {
+		if !unusedName.MatchString(name) {
+			return nil, fmt.Errorf("geese: invalid unused name %q: a table or table.column", name)
+		}
+	}
 	parsed, err := pgx.ParseConfig(config.DatabaseURL)
 	if err != nil {
 		return nil, err
@@ -218,7 +251,8 @@ func Join(ctx context.Context, config Config) (*Flock, error) {
 		return nil, err
 	}
 	f := &Flock{db: db, id: uuid.NewString(), name: config.Name, release: ReleaseMajor(config.Release), window: config.Window, weather: config.Weather,
-		migrator: config.Migrator, capabilities: slices.Clone(config.Capabilities), retired: retired, requests: map[uint64]admission{}}
+		migrator: config.Migrator, capabilities: slices.Clone(config.Capabilities), retired: retired, unused: append([]string{}, config.Unused...),
+		dbConfig: parsed, requests: map[uint64]admission{}}
 	if err := f.bootstrap(ctx); err != nil {
 		db.Close()
 		return nil, err

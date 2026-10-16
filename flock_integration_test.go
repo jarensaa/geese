@@ -557,3 +557,165 @@ func TestAFailedMigrationLetsTheFlockGoOn(t *testing.T) {
 		t.Fatalf("the failure is remembered: failed_for=%v failures=%d err=%v", failed, failures, err)
 	}
 }
+
+// classified is the stand-in's migrator, saying its migration changes what
+// the test says.
+type classified struct {
+	ledger
+	change Change
+}
+
+func (m classified) Change(int64) (Change, error) { return m.change, nil }
+
+func joinClassified(t *testing.T, ctx context.Context, url, name string, change Change, unused ...string) *Flock {
+	t.Helper()
+	live, err := Join(ctx, Config{DatabaseURL: url, Name: name, Release: "dev", Weather: ClearSkies{}, Migrator: classified{change: change},
+		Window: Window{ServeFrom: 1, ServeTo: 2, Latest: 2}, Unused: unused})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(live.Land)
+	return live
+}
+
+// A migration that code already serving keeps working through applies while
+// the flock serves: nothing gathers, and work in flight runs on.
+func TestAMigrationWithoutAPause(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	_, url := standIn(t, ctx)
+	leader := joinClassified(t, ctx, url, "leader", Change{})
+	other := joinClassified(t, ctx, url, "other", Change{})
+	work, release, err := other.Admit(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+
+	migrated := make(chan error, 1)
+	go func() { migrated <- leader.TryMigrate(ctx) }()
+	select {
+	case err := <-migrated:
+		if err != nil || leader.Version() != 2 {
+			t.Fatalf("migrated to %d: %v", leader.Version(), err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the migration waited for the flock")
+	}
+	if err := other.Honk(ctx); err != nil || other.Version() != 2 || other.gathering() || work.Err() != nil {
+		t.Fatalf("the flock paused: version %d, gathering %v, work %v, honk %v", other.Version(), other.gathering(), work.Err(), err)
+	}
+}
+
+// A migration that drops a column needs no pause once every goose heard
+// declares the column unused.
+func TestADropWaitsForEveryGooseToDeclareItUnused(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	_, url := standIn(t, ctx)
+	drop := Change{Drops: []string{"lists.archived"}}
+	leader := joinClassified(t, ctx, url, "leader", drop, "lists.archived", "invites")
+	older := joinClassified(t, ctx, url, "older", drop)
+
+	pauses := func() string {
+		t.Helper()
+		tx, _, err := leader.coordinated(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer tx.Rollback()
+		why, err := leader.pauses(ctx, tx, 2, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return why
+	}
+	if why := pauses(); !strings.Contains(why, "1 geese heard don't declare lists.archived unused") {
+		t.Fatalf("a goose that may read the column: %q", why)
+	}
+	older.Land()
+	if why := pauses(); why != "" {
+		t.Fatalf("every goose declares it unused: %q", why)
+	}
+}
+
+// altering is the stand-in's migrator, whose migration alters a table of the
+// application's, without a pause.
+type altering struct{ ledger }
+
+func (altering) Change(int64) (Change, error) { return Change{}, nil }
+
+func (m altering) MigrateTo(ctx context.Context, conn *sql.DB, target int64) error {
+	if _, err := conn.ExecContext(ctx, `ALTER TABLE lists ADD COLUMN colour text`); err != nil {
+		return err
+	}
+	return m.ledger.MigrateTo(ctx, conn, target)
+}
+
+// A migration without a pause gives up waiting for a lock, as a long read
+// holds one, rather than hold up the queries queued behind it; the next
+// attempt pauses.
+func TestAMigrationWithoutAPauseGivesUpOnALock(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	conn, url := standIn(t, ctx)
+	if _, err := conn.ExecContext(ctx, `CREATE TABLE lists (id bigint)`); err != nil {
+		t.Fatal(err)
+	}
+	leader, err := Join(ctx, Config{DatabaseURL: url, Name: "leader", Release: "dev", Weather: ClearSkies{}, Migrator: altering{},
+		Window: Window{ServeFrom: 1, ServeTo: 2, Latest: 2}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(leader.Land)
+	honking(t, ctx, leader)
+
+	reading, err := conn.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reading.ExecContext(ctx, `SELECT * FROM lists`); err != nil {
+		t.Fatal(err)
+	}
+	started := time.Now()
+	if err := leader.TryMigrate(ctx); err == nil || !strings.Contains(err.Error(), "lock timeout") {
+		t.Fatalf("migrated through a lock: %v", err)
+	}
+	if waited := time.Since(started); waited > 5*time.Second {
+		t.Fatalf("waited %s for the lock", waited)
+	}
+	reading.Rollback()
+
+	if _, err := conn.ExecContext(ctx, `UPDATE geese_flight SET retry_at=clock_timestamp()`); err != nil {
+		t.Fatal(err)
+	}
+	if err := leader.TryMigrate(ctx); err != nil || leader.Version() != 2 {
+		t.Fatalf("the attempt with a pause migrated to %d: %v", leader.Version(), err)
+	}
+	var pausing bool
+	if err := conn.QueryRowContext(ctx, `SELECT pausing FROM geese_flight`).Scan(&pausing); err != nil || !pausing {
+		t.Fatalf("the attempt after a failure didn't pause: %v", err)
+	}
+}
+
+// Tests run on a database without what the flight plan declares unused.
+func TestDropUnused(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	conn, _ := geesetest.Start(t, ctx)
+	if _, err := conn.ExecContext(ctx, `CREATE SCHEMA app; CREATE TABLE app.tokens (id bigint);
+		CREATE TABLE lists (id bigint, archived boolean); CREATE TABLE invites (id bigint)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := geesetest.DropUnused(ctx, conn, []string{"lists.archived", "invites", "app.tokens"}); err != nil {
+		t.Fatal(err)
+	}
+	var left string
+	if err := conn.QueryRowContext(ctx, `SELECT string_agg(table_schema||'.'||table_name||'.'||column_name, ',' ORDER BY 1)
+		FROM information_schema.columns WHERE table_schema IN ('public','app')`).Scan(&left); err != nil || left != "public.lists.id" {
+		t.Fatalf("left %q: %v", left, err)
+	}
+	if err := geesetest.DropUnused(ctx, conn, []string{"nothing"}); err == nil {
+		t.Fatal("dropped a name that's nothing")
+	}
+}
