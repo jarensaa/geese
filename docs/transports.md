@@ -8,7 +8,7 @@ geese knows no transport. Everything a transport needs is in the core package:
 | `flock.Ready()` | The health check: false while the goose is grounded. |
 | `flock.Capabilities(ctx)` | What clients read: what's switched on, and the oldest release whose pages are served. |
 | `flock.Require(ctx, name)` | What a handler asks before it serves a feature. |
-| `geese.ErrGrounded`, `ErrInactive` | Why something was refused. Each means "not now, try again": map them to the transport's way of saying so. |
+| `geese.ErrGrounded`, `ErrRoosting`, `ErrInactive` | Why something was refused. Each means "not now, try again": map them to the transport's way of saying so. |
 
 Whatever the transport, the rules are the same:
 
@@ -25,7 +25,7 @@ mux.Handle("POST /api/posts/{id}/comments", geesehttp.Require(flock, "comments",
 server := &http.Server{Handler: geesehttp.Guard(flock, mux)}
 ```
 
-`Guard` admits every request, WebSocket upgrades and streams of server-sent events included. Refusals are `503` with `Retry-After`; a feature that isn't on is `{"code": "feature_unavailable", ...}`.
+`Guard` admits every request, WebSocket upgrades and streams of server-sent events included. Refusals, while a goose is grounded or the flock is down for a migration, are `503` with `Retry-After`; a feature that isn't on is `{"code": "feature_unavailable", ...}`.
 
 ## gRPC
 
@@ -63,13 +63,15 @@ type admitted struct {
 
 func (s admitted) Context() context.Context { return s.ctx }
 
-// unavailable is UNAVAILABLE, with why: grounded, or a feature that isn't on
-// yet.
+// unavailable is UNAVAILABLE, with why: grounded, down for a migration, or a
+// feature that isn't on yet.
 func unavailable(err error) error {
 	reason := "UNAVAILABLE"
 	switch {
 	case errors.Is(err, geese.ErrInactive):
 		reason = "FEATURE_UNAVAILABLE"
+	case errors.Is(err, geese.ErrRoosting):
+		reason = "MIGRATING"
 	case errors.Is(err, geese.ErrGrounded):
 		reason = "GROUNDED"
 	}

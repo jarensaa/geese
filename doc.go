@@ -10,7 +10,8 @@
 // drops (Config.Unused). The flock serves throughout: the migrator says what
 // each migration changes (Change), and the leader runs only those that keep
 // the code already serving working, such as adding a table or a nullable
-// column.
+// column. A migration that asks for downtime runs instead with the flock down:
+// every goose refuses new work (ErrRoosting) and finishes what it has, first.
 //
 // The same agreement switches capabilities on for the whole deployment at once,
 // and says the oldest release whose pages the flock still serves, so a page
@@ -22,7 +23,7 @@
 // place cancels what it admitted before the flock counts it gone.
 //
 // geese knows no transport: Admit, Capabilities and Require, with the errors
-// ErrGrounded and ErrInactive, are all a transport needs. Package geesehttp
+// ErrGrounded, ErrRoosting and ErrInactive, are all a transport needs. Package geesehttp
 // is an adapter for net/http; docs/transports.md shows gRPC.
 //
 // geese decides when; the application's migrator runs the migrations (package

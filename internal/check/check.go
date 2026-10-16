@@ -125,6 +125,24 @@ func Disruptive(migrations map[string]string, plan geese.FlightPlan) []string {
 	return problems
 }
 
+// Downtime says which migrations the flock would run, after the baseline, ask
+// for downtime: for review, not a problem.
+func Downtime(migrations map[string]string, plan geese.FlightPlan) []string {
+	var lines []string
+	for path, migration := range migrations {
+		_, name := split(path)
+		match := versionedName.FindStringSubmatch(name)
+		if match == nil {
+			continue
+		}
+		if version, err := strconv.ParseInt(match[1], 10, 64); err == nil && version > plan.MinimumSupportedVersion && goose.Classify([]byte(migration)).Downtime {
+			lines = append(lines, path+" takes the flock down while it runs")
+		}
+	}
+	slices.Sort(lines)
+	return lines
+}
+
 // Compatibility checks each compatibility file: code kept for an older
 // schema version the image still serves, named compat_vNNNN.go (or
 // compat_vNNNN_<what>.go). It must be within the serving window and name the

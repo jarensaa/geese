@@ -2,7 +2,7 @@
 
 An application that runs as several processes on one PostgreSQL database has a problem every time it migrates. During a rolling deploy, old and new processes serve side by side. A migration run before the rollout breaks the old processes; one run after it breaks the new ones; one run by whichever process starts first races the others. The usual answer is expand and contract: every change made in steps that each keep the running code working, over several releases, by hand, and trusted.
 
-geese runs those steps for you, and checks them. The processes agree, in the database, on when the next migration may run; geese runs only migrations that keep the code already serving working, and drops a column only once every image running says its code no longer touches it. The flock serves throughout: nothing is held, cancelled or reconnected.
+geese runs those steps for you, and checks them. The processes agree, in the database, on when the next migration may run; geese runs only migrations that keep the code already serving working, and drops a column only once every image running says its code no longer touches it. The flock serves throughout: nothing is held, cancelled or reconnected. And when a change isn't worth the steps, its migration can ask for downtime instead, in so many words.
 
 ## The flock
 
@@ -13,6 +13,7 @@ geese runs those steps for you, and checks them. The processes agree, in the dat
 | **Grounded** | A goose that can't honk, or can't serve what the flock has, admits no work and cancels what it had, before the others count it gone. It flies again once a honk is heard. |
 | **Leader** | Whoever holds the leader's advisory lock, and only in **calm weather** (a Kubernetes rollout has settled). It alone migrates, switches capabilities on and raises the oldest page served. When it lands, another takes over. |
 | **Heading** | Where the flock is migrating to. While it's set, a goose that can't serve it, or may still use what the migration drops, can't join. |
+| **Roost** | The flock is down for a migration that asked for downtime: every goose stops serving, with nothing running, until it's done. |
 | **Flight plan** | The migration window, kept in the repository: at most four active migrations, the schema versions an image serves, and what its code no longer touches. |
 
 ## A migration, step by step
@@ -44,7 +45,7 @@ geese reads each migration (package goose's `Classify`), and runs only what keep
 | Building an index on a table in use, `CONCURRENTLY` | It doesn't block writes. Goose runs it outside a transaction, so the migration does only this, after `DROP INDEX CONCURRENTLY IF EXISTS` of the same index: a build that fails is tried again afresh. |
 | Dropping a table or a column every running image declares unused | [Below](#dropping-what-isnt-used). |
 
-Anything else, the flock won't run: a rename, a changed type, an index built on a table in use without `CONCURRENTLY`, a column with a default that isn't a constant or a constraint that checks every row, changes to data, and anything geese can't read for certain. `geese check` fails it in CI, and says why:
+Anything else, the flock won't run while it serves: a rename, a changed type, an index built on a table in use without `CONCURRENTLY`, a column with a default that isn't a constant or a constraint that checks every row, changes to data, and anything geese can't read for certain. `geese check` fails it in CI, and says why, unless the migration [asks for downtime](#migrations-with-downtime):
 
 ```
 flight plan: migrations/00003_rename.sql would disrupt the flock: geese can't tell code already serving keeps working through "ALTER TABLE lists RENAME name TO title": make it in steps that do
@@ -61,7 +62,7 @@ A rename, a new type, a column made `NOT NULL`, data reshaped: none of them keep
 3. **Switch.** Code reads `title` once the capability is on; the next release reads and writes only `title`, and declares `lists.name` unused.
 4. **Contract.** A later release drops `name`, once every image running declares it unused.
 
-Each step is a migration geese runs, or code geese's capabilities and declarations check.
+Each step is a migration geese runs, or code geese's capabilities and declarations check. When the steps aren't worth it, the change is one migration with [downtime](#migrations-with-downtime).
 
 ### Dropping what isn't used
 
@@ -74,6 +75,35 @@ Whether code still uses a column is a fact about the images running, not about t
 and passes it on as `Config.Unused`, so each of its geese says so with every honk. A later release drops the column, and keeps declaring it. The leader drops it once every goose it hears declares it unused; while a goose of an older image that doesn't is still flying, the drop waits. An image that forgets holds the drop back; it never breaks.
 
 A declaration is a claim about an image's code, so the application's tests check it: `geesetest.DropUnused` drops what the flight plan declares from the test database, and the tests then run on the schema the drop will leave. A query that still reads the column, `SELECT *` included, fails there.
+
+## Migrations with downtime
+
+Expand and contract keeps a service up through any change, at the price of several releases. When a change isn't worth that, as for a small service, or for a primary key's type, its migration asks for downtime, with one line:
+
+```sql
+-- +geese downtime
+-- +goose Up
+ALTER TABLE lists RENAME name TO title;
+
+-- +goose Down
+ALTER TABLE lists RENAME title TO name;
+```
+
+The first line is geese's; the rest is a goose migration as usual, whose `-- +goose Up` and `-- +goose Down` mark the statements that apply it and roll it back.
+
+The flock then **roosts** for it, instead of serving through it:
+
+1. The leader sets the heading, saying the flock roosts for it.
+2. On their next honk, every goose stops serving: new work is refused as unavailable (over HTTP, `503` with `Retry-After`; `ErrRoosting` in Go), and work in flight has ten seconds to finish before it's cancelled. Each says it has roosted once nothing runs. A roosting goose stays healthy: it's the flock that's down, not the process.
+3. Once every goose heard has roosted, the leader runs the migration, which may change anything: nothing runs the code before it, and every goose serves the version after it.
+4. The leader clears the heading, and every goose serves again on its next honk.
+
+While a heading is set, geese honk every quarter second, so the downtime is what the work in flight needs to finish, the migration's own time, and about a second more. If a goose doesn't roost within thirty seconds, the leader gives up, the flock serves again, and the attempt is tried later like any that failed. A migration with downtime runs in a transaction, as every other does, so one that fails leaves the schema as it was. `geese check` lists every migration that takes the flock down, so it's seen in review:
+
+```
+Flight plan OK: 3 of 4 active migrations, serving 2–3.
+  migrations/00003_rename.sql takes the flock down while it runs
+```
 
 ## Capabilities and the oldest page served
 

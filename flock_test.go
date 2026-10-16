@@ -145,3 +145,37 @@ func TestRetriesWaitTwiceAsLongUpToALimit(t *testing.T) {
 		}
 	}
 }
+
+// A roosting goose admits nothing new, gives its work in flight a grace to
+// finish, then cancels it, and flies again once the flock has migrated.
+func TestRoosting(t *testing.T) {
+	live := readyFlock()
+	work, release, err := live.Admit(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if live.roost(2) {
+		t.Fatal("roosted with work in flight")
+	}
+	if _, _, err := live.Admit(context.Background()); !errors.Is(err, ErrRoosting) {
+		t.Fatalf("admitted work while roosting: %v", err)
+	}
+	if work.Err() != nil {
+		t.Fatal("cancelled work in flight within its grace")
+	}
+	live.roostedAt = time.Now().Add(-roostGrace - time.Second)
+	live.roost(2)
+	if work.Err() == nil {
+		t.Fatal("work in flight past its grace ran on")
+	}
+	release()
+	if !live.roost(2) {
+		t.Fatal("not roosted once nothing runs")
+	}
+	live.wake()
+	if _, again, err := live.Admit(context.Background()); err != nil {
+		t.Fatalf("not admitted once awake: %v", err)
+	} else {
+		again()
+	}
+}

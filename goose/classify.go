@@ -18,7 +18,15 @@ import (
 // unused; and, outside a transaction, building an index concurrently, alone,
 // after dropping what a failed build of it left. Anything else, and anything
 // it can't read for certain, it says disrupts.
+//
+// A migration marked -- +geese downtime asks for the flock to stop serving
+// while it runs, and may then change anything, as long as it runs in a
+// transaction.
 func Classify(migration []byte) geese.Change {
+	downtime, why := asksForDowntime(string(migration))
+	if why != "" || downtime {
+		return geese.Change{Disrupts: why, Downtime: why == ""}
+	}
 	up, outside, why := upSection(string(migration))
 	if why != "" {
 		return geese.Change{Disrupts: why}
@@ -49,7 +57,37 @@ func Classify(migration []byte) geese.Change {
 	return geese.Change{Drops: drops}
 }
 
-var annotation = regexp.MustCompile(`^\s*--\s*\+goose\s+(.+?)\s*$`)
+var (
+	annotation      = regexp.MustCompile(`^\s*--\s*\+goose\s+(.+?)\s*$`)
+	geeseAnnotation = regexp.MustCompile(`^\s*--\s*\+geese\s+(.+?)\s*$`)
+)
+
+// asksForDowntime says whether a migration is marked -- +geese downtime, or
+// why such a migration can't run.
+func asksForDowntime(migration string) (bool, string) {
+	downtime, up, outside := false, false, false
+	for _, line := range strings.Split(migration, "\n") {
+		if match := geeseAnnotation.FindStringSubmatch(line); match != nil {
+			if !strings.EqualFold(match[1], "downtime") {
+				return false, fmt.Sprintf("it has -- +geese %s, which geese doesn't know", match[1])
+			}
+			downtime = true
+		}
+		if match := annotation.FindStringSubmatch(line); match != nil {
+			up = up || strings.EqualFold(match[1], "Up")
+			outside = outside || strings.EqualFold(match[1], "NO TRANSACTION")
+		}
+	}
+	switch {
+	case !downtime:
+		return false, ""
+	case !up:
+		return false, "it has no -- +goose Up line, which goose needs to run it"
+	case outside:
+		return false, "a migration with downtime runs in a transaction, so one that fails leaves the schema as it was"
+	}
+	return true, ""
+}
 
 // upSection is the SQL of a migration's Up section, and whether goose runs
 // it outside a transaction, or why it can't be read.
@@ -78,7 +116,7 @@ func upSection(migration string) (up string, outside bool, why string) {
 		}
 	}
 	if !seen {
-		return "", false, "it has no -- +goose Up section"
+		return "", false, "it has no -- +goose Up line, which goose needs to run it"
 	}
 	return b.String(), outside, ""
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/jarensaa/geese"
@@ -24,6 +25,17 @@ func TestGuardAnswersUnavailableWhenGrounded(t *testing.T) {
 	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/health", nil))
 	if response.Code != http.StatusServiceUnavailable || called || response.Header().Get("Retry-After") == "" {
 		t.Fatalf("expected 503 without invoking handler, got status %d and called=%t", response.Code, called)
+	}
+}
+
+func TestGuardSaysWhenTheFlockIsDownForAMigration(t *testing.T) {
+	handler := Guard(&admission{admit: func(context.Context) (context.Context, func(), error) {
+		return nil, nil, geese.ErrRoosting
+	}}, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/", nil))
+	if response.Code != http.StatusServiceUnavailable || !strings.Contains(response.Body.String(), "migrating") {
+		t.Fatalf("while the flock is down: %d %q", response.Code, response.Body.String())
 	}
 }
 

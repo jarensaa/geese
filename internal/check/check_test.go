@@ -81,6 +81,17 @@ func TestDisruptive(t *testing.T) {
 	}
 }
 
+func TestDowntimeIsAllowedAndSaid(t *testing.T) {
+	migrations := map[string]string{
+		"server/db/migrations/00002_rename.sql": "-- +geese downtime\n-- +goose Up\nALTER TABLE lists RENAME name TO title;",
+		"server/db/migrations/00003_colour.sql": "-- +goose Up\nALTER TABLE lists ADD COLUMN colour text;",
+	}
+	expect(t, Disruptive(migrations, plan), "")
+	if got := Downtime(migrations, plan); !slices.Equal(got, []string{"server/db/migrations/00002_rename.sql takes the flock down while it runs"}) {
+		t.Errorf("%q", got)
+	}
+}
+
 func TestCompatibilityFilesNameTheirToken(t *testing.T) {
 	window := with(func(p *geese.FlightPlan) { p.MinimumServeVersion = 3 })
 	expect(t, Compatibility(map[string]string{"server/app/compat_v0003_lists.go": "const _ = support.ServeV3"}, window, layout), "")

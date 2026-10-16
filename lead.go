@@ -80,8 +80,9 @@ func (f *Flock) unanimous(ctx context.Context, tx *sql.Tx) error {
 // next version and declares unused what it drops, and the migrator says it
 // keeps the code already serving working. The heading it sets first fences
 // out a goose that joins meanwhile and couldn't serve the migration. A
-// migration that fails changes nothing, and the next attempt waits
-// (retryAfter).
+// migration that asked for downtime runs instead once every goose heard has
+// roosted: stopped serving, with nothing running. A migration that fails
+// changes nothing, and the next attempt waits (retryAfter).
 func (f *Flock) TryMigrate(ctx context.Context) error {
 	if f.Version() >= f.window.Latest && !f.headingSet.Load() {
 		return nil
@@ -138,23 +139,36 @@ func (f *Flock) TryMigrate(ctx context.Context) error {
 	if err != nil {
 		return f.fail(ctx, tx, current, target, err)
 	}
-	// A goose that may still use what the migration drops holds it back, until it lands.
-	var undeclared int
-	if err = tx.QueryRowContext(ctx, `SELECT count(*) FROM geese_flock WHERE heard_until > clock_timestamp() AND NOT (unused @> $1::text[])`,
-		append([]string{}, change.Drops...)).Scan(&undeclared); err != nil {
-		return err
+	// While the flock serves, a goose that may still use what the migration
+	// drops holds it back, until it lands. With the flock down, nothing runs
+	// the code before the migration, and each goose serves the one after.
+	if !change.Downtime {
+		var undeclared int
+		if err = tx.QueryRowContext(ctx, `SELECT count(*) FROM geese_flock WHERE heard_until > clock_timestamp() AND NOT (unused @> $1::text[])`,
+			append([]string{}, change.Drops...)).Scan(&undeclared); err != nil {
+			return err
+		}
+		if undeclared > 0 {
+			return nil
+		}
 	}
-	if undeclared > 0 {
-		return nil
-	}
-	if _, err = tx.ExecContext(ctx, `UPDATE geese_flight SET heading_for=$1,dropping=$2::text[] WHERE id=true`, target, append([]string{}, change.Drops...)); err != nil {
+	if _, err = tx.ExecContext(ctx, `UPDATE geese_flight SET heading_for=$1,dropping=$2::text[],roosting=$3 WHERE id=true`,
+		target, append([]string{}, change.Drops...), change.Downtime); err != nil {
 		return err
 	}
 	if err = tx.Commit(); err != nil {
 		return err
 	}
-	slog.Info("geese: migrating", "target", target)
-	if err = f.migrate(ctx, target, change); err == nil {
+	if change.Downtime {
+		slog.Info("geese: migrating, with the flock down", "target", target)
+		if err = f.awaitRoosted(ctx, target); err == nil {
+			err = f.migrator.MigrateTo(ctx, f.db, target)
+		}
+	} else {
+		slog.Info("geese: migrating", "target", target)
+		err = f.migrate(ctx, target, change)
+	}
+	if err == nil {
 		return f.finishMigration(ctx, target)
 	}
 	// What failed is recorded, even when the leader's step was cancelled.
@@ -199,6 +213,29 @@ func (f *Flock) migrate(ctx context.Context, target int64, change Change) error 
 	return err
 }
 
+// awaitRoosted waits until every goose heard has roosted for target.
+func (f *Flock) awaitRoosted(ctx context.Context, target int64) error {
+	deadline := time.Now().Add(roostTimeout)
+	for {
+		var awake int
+		if err := f.db.QueryRowContext(ctx, `SELECT count(*) FROM geese_flock WHERE heard_until > clock_timestamp()
+			AND roosted_for IS DISTINCT FROM $1`, target).Scan(&awake); err != nil {
+			return err
+		}
+		if awake == 0 {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("geese: %d geese didn't stop serving for migration %d", awake, target)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+}
+
 // lockNotAvailable says whether err is PostgreSQL giving up waiting for a lock.
 func lockNotAvailable(err error) bool {
 	var pgErr *pgconn.PgError
@@ -218,7 +255,7 @@ func (f *Flock) fail(ctx context.Context, tx *sql.Tx, current, target int64, why
 	}
 	failures++
 	retry := retryIn(failures)
-	if _, err := tx.ExecContext(ctx, `UPDATE geese_flight SET heading_for=NULL,dropping='{}',failed_for=$1,failures=$2,
+	if _, err := tx.ExecContext(ctx, `UPDATE geese_flight SET heading_for=NULL,dropping='{}',roosting=false,failed_for=$1,failures=$2,
 		retry_at=clock_timestamp()+$3::interval,failure=$4 WHERE id=true`, target, failures, retry.String(), why.Error()); err != nil {
 		return errors.Join(why, err)
 	}
@@ -238,7 +275,7 @@ func (f *Flock) finishMigration(ctx context.Context, target int64) error {
 	if version != target {
 		return fmt.Errorf("geese: the schema is at %d, expected %d", version, target)
 	}
-	if _, err = tx.ExecContext(ctx, `UPDATE geese_flight SET heading_for=NULL,dropping='{}',failed_for=NULL,failures=0,retry_at=NULL,failure=NULL
+	if _, err = tx.ExecContext(ctx, `UPDATE geese_flight SET heading_for=NULL,dropping='{}',roosting=false,failed_for=NULL,failures=0,retry_at=NULL,failure=NULL
 		WHERE id=true AND heading_for=$1`, target); err != nil {
 		return err
 	}

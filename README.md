@@ -8,7 +8,7 @@
   <a href="https://github.com/jarensaa/geese/blob/main/LICENSE"><img src="https://img.shields.io/github/license/jarensaa/geese" alt="License: Apache 2.0"></a>
 </p>
 
-**geese runs schema migrations for Go services that run as many processes on one PostgreSQL database, while they serve: no downtime, no pause, no disruption, and every step of expand and contract checked.**
+**geese runs schema migrations for Go services that run as many processes on one PostgreSQL database, while they serve: no downtime and no disruption, every step of expand and contract checked, and downtime only for a migration that asks for it.**
 
 [Documentation](https://jarensaa.github.io/geese/) · [Getting started](docs/getting-started.md) · [Go reference](https://pkg.go.dev/github.com/jarensaa/geese)
 
@@ -19,6 +19,7 @@ Migration tools like [goose](https://github.com/pressly/goose) apply migrations.
 - **Migrations during rolling deploys.** One version at a time, once every running process serves the next version and the rollout has settled.
 - **Zero disruption.** The flock serves throughout every migration: nothing is held, cancelled or reconnected, and no query waits behind a migration for more than a moment.
 - **Only what keeps running code working.** geese reads each migration, and runs only changes old code can't notice: new tables and nullable columns, constraints added `NOT VALID`, indexes built `CONCURRENTLY`. Anything else, `geese check` fails in CI, with why, and you make it in steps that do.
+- **Downtime when you ask for it.** A migration marked `-- +geese downtime` may change anything: the flock stops serving while it runs, refusing new requests with `503` and finishing what's in flight, and serves again a second after it's done. `geese check` lists every one, for review.
 - **Drops, provably safe.** Each image declares the columns and tables its code no longer touches, and its tests run without them. A column is dropped once every running image declares it unused.
 - **Leader election built in**, with PostgreSQL advisory locks. If the leader dies mid-migration, the next one runs it again.
 - **Features switch on everywhere at once.** A capability activates when its schema is in place and every process serves it, so processes never disagree about what a client may use.
@@ -170,7 +171,7 @@ The guides are on [the documentation site](https://jarensaa.github.io/geese/), a
 - [Capabilities and the oldest page served](docs/capabilities.md)
 - [Transports: HTTP, gRPC and more](docs/transports.md)
 - [The protocol](PROTOCOL.md)
-- Design decisions: [live schema migrations](docs/decisions/0001-live-schema-migrations.md), [capabilities](docs/decisions/0002-capabilities.md), [the oldest page served](docs/decisions/0003-oldest-page-served.md), [a failed migration](docs/decisions/0004-a-failed-migration.md), [pausing only when it must](docs/decisions/0005-pausing-only-when-it-must.md), [never pausing](docs/decisions/0006-never-pausing.md)
+- Design decisions: [live schema migrations](docs/decisions/0001-live-schema-migrations.md), [capabilities](docs/decisions/0002-capabilities.md), [the oldest page served](docs/decisions/0003-oldest-page-served.md), [a failed migration](docs/decisions/0004-a-failed-migration.md), [pausing only when it must](docs/decisions/0005-pausing-only-when-it-must.md), [never pausing](docs/decisions/0006-never-pausing.md), [downtime when asked for](docs/decisions/0007-downtime-when-asked-for.md)
 
 ## Status
 

@@ -91,3 +91,7 @@ enableRobotsTXT = false
   name = "Never pausing"
   pageRef = "/docs/decisions/0006-never-pausing"
   weight = 60
+[[menus.decisions]]
+  name = "Downtime when asked for"
+  pageRef = "/docs/decisions/0007-downtime-when-asked-for"
+  weight = 70

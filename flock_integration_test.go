@@ -692,3 +692,63 @@ func TestDropUnused(t *testing.T) {
 		t.Fatal("dropped a name that's nothing")
 	}
 }
+
+// recording is the stand-in's migrator, whose migration asks for downtime and
+// says when it ran.
+type recording struct {
+	ledger
+	ran chan time.Time
+}
+
+func (recording) Change(int64) (Change, error) { return Change{Downtime: true}, nil }
+
+func (m recording) MigrateTo(ctx context.Context, conn *sql.DB, target int64) error {
+	m.ran <- time.Now()
+	return m.ledger.MigrateTo(ctx, conn, target)
+}
+
+// A migration that asks for downtime runs once every goose has stopped
+// serving: new work is refused meanwhile, work in flight finishes first, and
+// the flock serves again once it's done.
+func TestAMigrationWithDowntime(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	_, url := standIn(t, ctx)
+	migrator := recording{ran: make(chan time.Time, 1)}
+	join := func(name string) *Flock {
+		live, err := Join(ctx, Config{DatabaseURL: url, Name: name, Release: "dev", Weather: ClearSkies{}, Migrator: migrator,
+			Window: Window{ServeFrom: 1, ServeTo: 2, Latest: 2}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(live.Land)
+		honking(t, ctx, live)
+		return live
+	}
+	leader, other := join("leader"), join("other")
+	_, release, err := other.Admit(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	released := make(chan time.Time, 1)
+	time.AfterFunc(time.Second, func() { released <- time.Now(); release() })
+
+	migrated := make(chan error, 1)
+	go func() { migrated <- leader.TryMigrate(ctx) }()
+	time.Sleep(500 * time.Millisecond)
+	if _, _, err := other.Admit(ctx); !errors.Is(err, ErrRoosting) {
+		t.Fatalf("admitted work while the flock is down: %v", err)
+	}
+	if err := <-migrated; err != nil {
+		t.Fatal(err)
+	}
+	if ran, done := <-migrator.ran, <-released; ran.Before(done) {
+		t.Fatal("migrated while work was still running")
+	}
+	time.Sleep(500 * time.Millisecond)
+	if _, again, err := other.Admit(ctx); err != nil || other.Version() != 2 {
+		t.Fatalf("not serving at 2 after the migration: version %d, %v", other.Version(), err)
+	} else {
+		again()
+	}
+}

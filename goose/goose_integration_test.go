@@ -137,3 +137,24 @@ func TestTheFlockRunsOnlyWhatDoesntDisruptIt(t *testing.T) {
 		t.Fatalf("the index isn't built: %v", err)
 	}
 }
+
+// A migration that asks for downtime may change anything: the flock is down
+// while it runs.
+func TestAMigrationWithDowntimeRuns(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	conn, _ := geesetest.Start(t, ctx)
+	migrations := Migrations{FS: fstest.MapFS{
+		"migrations/00001_lists.sql":  {Data: []byte("-- +goose Up\nCREATE TABLE lists (id bigint PRIMARY KEY, name text);\n")},
+		"migrations/00002_rename.sql": {Data: []byte("-- +geese downtime\n-- +goose Up\nALTER TABLE lists RENAME name TO title;\n")},
+	}, Dir: "migrations"}
+	if err := migrations.MigrateTo(ctx, conn, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := migrations.MigrateTo(ctx, conn, 2); err != nil {
+		t.Fatalf("a rename, with downtime: %v", err)
+	}
+	if _, err := conn.ExecContext(ctx, `SELECT title FROM lists`); err != nil {
+		t.Fatal(err)
+	}
+}

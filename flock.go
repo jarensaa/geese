@@ -70,8 +70,8 @@ type Migrator interface {
 }
 
 // Change is what a migration does to code already serving the schema before
-// it. The flock serves throughout every migration it runs, so it runs only
-// those that keep that code working.
+// it. The flock serves throughout a migration, so it runs only those that keep
+// that code working, unless the migration asks for downtime.
 type Change struct {
 	// Disrupts says why the migration could break code already serving, or
 	// hold it up: the flock won't run it. Empty, the migration keeps that code
@@ -83,6 +83,9 @@ type Change struct {
 	// Concurrently says it builds an index without blocking writes, waiting
 	// for the transactions before it to end: it isn't held to a lock timeout.
 	Concurrently bool
+	// Downtime says its author asked for the flock to stop serving while it
+	// runs: the flock roosts for it, and it may change anything.
+	Downtime bool
 }
 
 // Config is what a process brings to the flock.
@@ -115,6 +118,9 @@ var (
 	// flock: its lease lapsed, or it can't serve the schema or capabilities
 	// the flock has. It serves again once a honk is heard.
 	ErrGrounded = errors.New("geese: grounded, without a place in the flock")
+	// ErrRoosting is the answer to work while the flock is down for a
+	// migration that asked for downtime. It serves again once that's done.
+	ErrRoosting = errors.New("geese: the flock is down for a migration")
 	// ErrInactive is the answer to a feature whose capability isn't on yet
 	// (Require). A client reads it as "not yet", whatever the transport.
 	ErrInactive = errors.New("geese: the capability isn't on yet")
@@ -124,10 +130,22 @@ var (
 // heard for leaseFor: one that isn't heard again has left the flock. Its own
 // deadline is shorter than the flock's, so it stops its work before the others
 // count it gone.
+// While the flock has a heading, a goose honks every headingInterval, so a
+// migration that takes the flock down keeps it down as briefly as it can.
 const (
-	renewInterval = 2 * time.Second
-	leaseFor      = 10 * time.Second
-	ownDeadline   = 8 * time.Second
+	renewInterval   = 2 * time.Second
+	headingInterval = 250 * time.Millisecond
+	leaseFor        = 10 * time.Second
+	ownDeadline     = 8 * time.Second
+)
+
+// For a migration with downtime, the flock roosts: every goose admits nothing
+// new, gives its work in flight roostGrace to finish before cancelling it, and
+// says it has roosted. The leader migrates once every goose heard has, and
+// gives up after roostTimeout.
+const (
+	roostGrace   = 10 * time.Second
+	roostTimeout = 30 * time.Second
 )
 
 // How the flock migrates while it serves. A migration waits at most
@@ -182,6 +200,9 @@ type Flock struct {
 	requests     map[uint64]context.CancelFunc
 	nextRequest  uint64
 	leaderCancel context.CancelFunc
+	// While roosting for a migration: its target, and when roosting began.
+	roostingFor int64
+	roostedAt   time.Time
 }
 
 // Join takes this process's place in the flock: it checks it can serve the

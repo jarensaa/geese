@@ -52,6 +52,7 @@ func (f *Flock) bootstrap(ctx context.Context) error {
 		capabilities  text[]      NOT NULL DEFAULT '{}',
 		unused        text[]      NOT NULL DEFAULT '{}',
 		release_major bigint,
+		roosted_for   bigint,
 		heard_until   timestamptz NOT NULL,
 		joined_at     timestamptz NOT NULL DEFAULT clock_timestamp()
 	)`); err != nil {
@@ -61,6 +62,7 @@ func (f *Flock) bootstrap(ctx context.Context) error {
 		id                  boolean     PRIMARY KEY DEFAULT true CHECK (id),
 		heading_for         bigint,
 		dropping            text[]      NOT NULL DEFAULT '{}',
+		roosting            boolean     NOT NULL DEFAULT false,
 		active_capabilities text[]      NOT NULL DEFAULT '{}',
 		oldest_page_major   bigint,
 		failed_for          bigint,
@@ -146,7 +148,8 @@ func (f *Flock) Honk(ctx context.Context) error {
 	defer tx.Rollback()
 	var heading, floor sql.NullInt64
 	var encoded, dropping string
-	if err = tx.QueryRowContext(ctx, `SELECT heading_for,to_json(dropping)::text,to_json(active_capabilities)::text,oldest_page_major FROM geese_flight WHERE id=true`).Scan(&heading, &dropping, &encoded, &floor); err != nil {
+	var roosting bool
+	if err = tx.QueryRowContext(ctx, `SELECT heading_for,to_json(dropping)::text,roosting,to_json(active_capabilities)::text,oldest_page_major FROM geese_flight WHERE id=true`).Scan(&heading, &dropping, &roosting, &encoded, &floor); err != nil {
 		f.ground()
 		return err
 	}
@@ -173,10 +176,16 @@ func (f *Flock) Honk(ctx context.Context) error {
 		f.ground()
 		return err
 	}
-	if _, err = tx.ExecContext(ctx, `INSERT INTO geese_flock (id,name,protocol,serves_from,serves_to,capabilities,unused,release_major,heard_until)
-		VALUES ($1,$2,$3,$4,$5,$6::text[],$7::text[],$8,clock_timestamp()+$9::interval)
-		ON CONFLICT (id) DO UPDATE SET capabilities=EXCLUDED.capabilities,heard_until=EXCLUDED.heard_until`,
-		f.id, f.name, protocol, f.window.ServeFrom, f.window.ServeTo, f.supportedNames(), f.unused, f.release, leaseFor.String()); err != nil {
+	// A heading that asked for downtime: roost for it, and say so once nothing runs.
+	roosting = roosting && heading.Valid && version < heading.Int64
+	var roostedFor sql.NullInt64
+	if roosting && f.roost(heading.Int64) {
+		roostedFor = heading
+	}
+	if _, err = tx.ExecContext(ctx, `INSERT INTO geese_flock (id,name,protocol,serves_from,serves_to,capabilities,unused,release_major,roosted_for,heard_until)
+		VALUES ($1,$2,$3,$4,$5,$6::text[],$7::text[],$8,$9,clock_timestamp()+$10::interval)
+		ON CONFLICT (id) DO UPDATE SET capabilities=EXCLUDED.capabilities,roosted_for=EXCLUDED.roosted_for,heard_until=EXCLUDED.heard_until`,
+		f.id, f.name, protocol, f.window.ServeFrom, f.window.ServeTo, f.supportedNames(), f.unused, f.release, roostedFor, leaseFor.String()); err != nil {
 		f.ground()
 		return err
 	}
@@ -188,6 +197,9 @@ func (f *Flock) Honk(ctx context.Context) error {
 	f.headingSet.Store(heading.Valid)
 	if !f.keepUntil(epoch, honked.Add(ownDeadline)) {
 		return errGroundedMidHonk
+	}
+	if !roosting {
+		f.wake()
 	}
 	return nil
 }
@@ -247,10 +259,14 @@ func (f *Flock) keepUntil(epoch uint64, deadline time.Time) bool {
 func (f *Flock) Fly(ctx context.Context) {
 	go f.leadWhenCalm(ctx)
 	for {
+		interval := renewInterval
+		if f.headingSet.Load() {
+			interval = headingInterval
+		}
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(renewInterval):
+		case <-time.After(interval):
 		}
 		// A honk under way when ctx ends finishes: a goose cut off mid-honk
 		// would be grounded, cancelling the work its process is finishing.

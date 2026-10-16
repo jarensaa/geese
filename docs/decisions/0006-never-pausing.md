@@ -1,6 +1,6 @@
 # Decision 0006: The flock never pauses
 
-Status: Accepted. Supersedes the pause of [decision 0001](0001-live-schema-migrations.md) (*Draining for an upgrade*) and [decision 0005](0005-pausing-only-when-it-must.md), whose classification, declarations and lock waits stand.
+Status: Accepted, and amended by [decision 0007](0007-downtime-when-asked-for.md): a migration may ask for downtime. Supersedes the pause of [decision 0001](0001-live-schema-migrations.md) (*Draining for an upgrade*) and [decision 0005](0005-pausing-only-when-it-must.md), whose classification, declarations and lock waits stand.
 
 ## Context
 

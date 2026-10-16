@@ -17,10 +17,11 @@ Made by the first goose to join, if missing, outside the application's migration
 | `capabilities` | The capabilities it serves: its own and the retired ones it accepts. |
 | `unused` | The tables (`invites`) and columns (`lists.archived`) its image's code never touches, as its flight plan declares. |
 | `release_major` | Its release's major version; null for a build that isn't a release. |
+| `roosted_for` | The migration it has roosted for: it admits nothing, and has nothing running, until that migration is applied. Null when it isn't roosting. |
 | `heard_until` | When the flock stops counting it, unless it honks again: ten seconds after its last honk, by the database's clock. |
 | `joined_at` | When it joined. |
 
-A goose writes its row with every honk, every two seconds, and deletes it when it lands. Rows whose `heard_until` has passed are of geese gone; nothing reads them.
+A goose writes its row with every honk, every two seconds (every quarter second while the flock has a heading), and deletes it when it lands. Rows whose `heard_until` has passed are of geese gone; nothing reads them.
 
 ### `geese_flight`: one row, the flock's shared decisions
 
@@ -28,6 +29,7 @@ A goose writes its row with every honk, every two seconds, and deletes it when i
 | --- | --- |
 | `heading_for` | The schema version the leader is migrating to; null when the flock isn't migrating. |
 | `dropping` | The tables and columns that migration drops. |
+| `roosting` | Whether the flock roosts for that migration, which asked for downtime. |
 | `active_capabilities` | The capabilities switched on. Only ever grows, until a baseline retires them. |
 | `oldest_page_major` | The oldest major release whose pages the flock serves; null until set. Never lowered. |
 | `failed_for` | The schema version the last attempt to migrate to didn't reach; null once the flock has migrated. |
@@ -43,12 +45,14 @@ The coordinator geese was extracted from, as `go-monolith-template` ran it, with
 
 - **Honks** in a transaction holding the coordination lock (`pg_advisory_xact_lock(0x6765657365636f6f)`), after reading the schema version applied and `geese_flight`.
 - **Grounds itself**, cancelling the work it admitted, when it can't serve the schema applied, an active capability, or the oldest page (its release is older, or isn't a release once a floor is set); when the heading is ahead of the schema applied and it can't serve the heading, or doesn't list in `unused` everything in `dropping`; and when its own deadline passes: eight seconds after the start of its last successful honk, by its own monotonic clock, so it stops before the flock stops counting it.
+- **Roosts** when `heading_for` is ahead of the schema applied and `roosting` is set: admits nothing new, lets admitted work finish (cancelling what runs past ten seconds), and writes `roosted_for` once nothing is running. It serves again when the heading is cleared.
 
 ## What the leader does
 
 The leader holds `pg_try_advisory_lock(0x67656573656c6561)` on a connection of its own, and acts only in calm weather. Each decision is made in a transaction holding the coordination lock, and **only while every goose heard speaks the leader's protocol** and no pod of the coordinator geese came from is heard (a live row in `schema_instances`).
 
 - **Migrating**: when every goose heard serves the next version and lists in `unused` everything the migration drops, and its migrator says the migration keeps the code already serving working, it sets `heading_for` to the version and `dropping` to what it drops, then runs the migration while the flock serves. It waits at most fifty milliseconds for each lock, and tries again a moment later when it doesn't get one, up to twenty times; a migration that builds an index concurrently isn't held to that. Then it clears the heading and `failed_for`. A heading equal to the schema applied is a migration its leader didn't live to say it finished: the next leader clears it.
+- **Migrating with downtime**: for a migration that asks for it, when every goose heard serves the next version, it sets `heading_for` with `roosting`, waits up to thirty seconds for every goose heard to have `roosted_for` equal to it, runs the migration, and clears the heading and `roosting`. A flock that doesn't roost in time is an attempt that doesn't migrate.
 - **An attempt that doesn't migrate**, because the migration failed or would disrupt the flock, leaves the schema as it was (the flock migrates only in a transaction). The leader clears the heading, and records the attempt in `failed_for`, `failures` and `retry_at`: no leader tries that version again before `retry_at`, thirty seconds after the first failure, twice as long after each one after, up to ten minutes.
 - **Activating a capability**: when the flock has no heading, the capability's schema is applied, its prerequisite holds, and every goose heard lists it in `capabilities`.
 - **Raising the oldest page**: when the flock has no heading, to the lowest `release_major` of any goose heard, if every goose heard has one and it's above the current floor.
